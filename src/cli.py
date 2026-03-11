@@ -24,6 +24,7 @@ from src.capture.audio_stream import find_blackhole_device, list_audio_devices
 from src.config import AgentConfig
 from src.storage.database import Database
 
+logger = logging.getLogger(__name__)
 console = Console()
 
 
@@ -77,7 +78,8 @@ def listen(device: int | None, mic: bool) -> None:
     signal.signal(signal.SIGTERM, _signal_handler)
 
     console.print("[bold green]DeskVoice listening...[/bold green] Press Ctrl+C to stop.")
-    console.print(f"  Model: {config.gemini.model}")
+    console.print(f"  Provider: {config.llm.provider}")
+    console.print(f"  Model: {config.llm.model}")
     console.print(f"  Database: {config.storage.db_path}")
     console.print()
 
@@ -256,6 +258,61 @@ def tags() -> None:
 
     console.print(table)
     db.close()
+
+
+@cli.command()
+@click.option("--device", type=int, default=None, help="Audio device index")
+@click.option("--mic", is_flag=True, help="Use default microphone")
+@click.option("--port", default=8765, help="Web UI port")
+@click.option("--no-listen", is_flag=True, help="UI only, no audio capture")
+def ui(device: int | None, mic: bool, port: int, no_listen: bool) -> None:
+    """Start the web dashboard with live transcript view."""
+    import threading
+    import uvicorn
+    from src.web.app import create_app
+
+    config = AgentConfig()
+
+    errors = config.validate()
+    if not no_listen and errors:
+        for e in errors:
+            console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    app = create_app(config)
+
+    # Start agent in background thread (unless --no-listen)
+    agent = None
+    if not no_listen:
+        if device is None and not mic:
+            bh = find_blackhole_device()
+            if bh is not None:
+                device = bh
+
+        agent = DeskVoiceAgent(config, device=device)
+
+        def run_agent():
+            try:
+                agent.start()
+            except Exception as e:
+                logger.error("Agent error: %s", e)
+
+        agent_thread = threading.Thread(target=run_agent, daemon=True)
+        agent_thread.start()
+
+    console.print(f"[bold green]DeskVoice UI running at http://localhost:{port}[/bold green]")
+    console.print(f"  Provider: {config.llm.provider} / {config.llm.model}")
+    if not no_listen:
+        console.print("  Audio capture: active")
+    console.print()
+
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if agent:
+            agent.stop()
 
 
 @cli.command()

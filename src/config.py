@@ -33,12 +33,37 @@ class AudioConfig:
 
 @dataclass
 class GeminiConfig:
-    """Gemini API settings."""
+    """Gemini API settings (legacy — use LLMConfig instead)."""
 
     api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
     model: str = "gemini-3-flash"  # Cheapest, fastest
     max_audio_bytes: int = 20 * 1024 * 1024  # 20MB per request
     temperature: float = 0.1  # Low creativity for transcription
+
+
+@dataclass
+class LLMConfig:
+    """Multi-provider LLM settings.
+
+    Supports: gemini, openai, ollama
+    """
+
+    provider: str = field(
+        default_factory=lambda: os.getenv("LLM_PROVIDER", "gemini")
+    )
+    api_key: str = field(
+        default_factory=lambda: os.getenv(
+            "LLM_API_KEY", os.getenv("GEMINI_API_KEY", "")
+        )
+    )
+    model: str = field(
+        default_factory=lambda: os.getenv("LLM_MODEL", "gemini-3-flash")
+    )
+    base_url: str = field(
+        default_factory=lambda: os.getenv("LLM_BASE_URL", "")
+    )
+    temperature: float = 0.1
+    max_audio_bytes: int = 20 * 1024 * 1024
 
 
 @dataclass
@@ -67,6 +92,7 @@ class AgentConfig:
 
     audio: AudioConfig = field(default_factory=AudioConfig)
     gemini: GeminiConfig = field(default_factory=GeminiConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
 
     # Agent behavior
@@ -79,6 +105,8 @@ class AgentConfig:
 
     def validate(self) -> list[str]:
         errors = []
-        if not self.gemini.api_key:
-            errors.append("GEMINI_API_KEY is required")
+        if self.llm.provider != "ollama" and not self.llm.api_key:
+            errors.append(
+                f"LLM_API_KEY (or GEMINI_API_KEY) is required for provider '{self.llm.provider}'"
+            )
         return errors

@@ -32,7 +32,7 @@ from src.capture.vad import SileroVAD
 from src.config import AgentConfig
 from src.models.models import AudioChunk, AudioType
 from src.processing.classifier import classify_audio
-from src.processing.gemini import GeminiProcessor
+from src.processing.llm_provider import create_provider
 from src.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class DeskVoiceAgent:
         # Components
         self._audio = AudioStream(config.audio, device=device)
         self._vad = SileroVAD(config.audio)
-        self._gemini = GeminiProcessor(config.gemini)
+        self._llm = create_provider(config.llm)
         self._db = Database(config.storage.db_path)
 
         # State
@@ -166,7 +166,7 @@ class DeskVoiceAgent:
 
         # Step 2: Send to Gemini for transcription + insight extraction
         try:
-            insight = self._gemini.transcribe_and_extract(chunk)
+            insight = self._llm.transcribe_and_extract(chunk)
             self._stats["gemini_calls"] += 1
         except Exception as e:
             logger.error("Gemini processing failed: %s", e)
@@ -225,6 +225,36 @@ class DeskVoiceAgent:
             tags = ", ".join(f"#{h.tag}" for h in insight.hashtags)
             logger.info("[tags] %s", tags)
 
+        # Broadcast to web UI
+        self._broadcast_insight(insight, chunk)
+
+    def _broadcast_insight(self, insight, chunk: AudioChunk) -> None:
+        """Send insight data to connected web UI clients."""
+        try:
+            from src.web.app import broadcast_event
+            import src.web as web_mod
+            web_mod._agent_stats = self._stats.copy()
+            broadcast_event("insight", {
+                "transcript": insight.transcript,
+                "summary": insight.summary,
+                "tasks": [
+                    {"id": t.id, "description": t.description, "assignee": t.assignee,
+                     "priority": t.priority.value, "due_hint": t.due_hint}
+                    for t in insight.tasks
+                ],
+                "decisions": insight.decisions,
+                "questions": insight.questions,
+                "hashtags": [{"tag": h.tag, "context": h.context} for h in insight.hashtags],
+                "token_usage": {
+                    "input_tokens": insight.token_usage.input_tokens,
+                    "output_tokens": insight.token_usage.output_tokens,
+                    "total_tokens": insight.token_usage.total_tokens,
+                } if insight.token_usage else None,
+                "duration_seconds": chunk.duration_seconds,
+            })
+        except Exception:
+            pass  # Web UI not running
+
     # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------
@@ -234,6 +264,11 @@ class DeskVoiceAgent:
         self._current_session_id = self._db.create_session()
         self._last_speech_time = datetime.now()
         logger.info("Session started: #%d", self._current_session_id)
+        try:
+            from src.web.app import broadcast_event
+            broadcast_event("session_started", {"session_id": self._current_session_id})
+        except Exception:
+            pass
 
     def _end_session(self) -> None:
         """End the current session."""
@@ -243,6 +278,11 @@ class DeskVoiceAgent:
         self._db.end_session(self._current_session_id)
         self._stats["sessions_completed"] += 1
         logger.info("Session ended: #%d", self._current_session_id)
+        try:
+            from src.web.app import broadcast_event
+            broadcast_event("session_ended", {"session_id": self._current_session_id})
+        except Exception:
+            pass
 
         # Generate a summary for the session using Gemini
         self._summarize_session(self._current_session_id)
