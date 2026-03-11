@@ -96,6 +96,51 @@ def create_app(config: AgentConfig) -> FastAPI:
         """Get agent stats if available."""
         return _agent_stats.copy() if _agent_stats else {}
 
+    # --- Speaker endpoints ---
+    @app.get("/api/speakers")
+    def get_speakers():
+        return db.list_speakers()
+
+    @app.post("/api/speakers")
+    async def enroll_speaker(request: Request):
+        body = await request.json()
+        name = body.get("name", "")
+        if not name:
+            return {"error": "name is required"}
+        # Enrollment via API requires pre-recorded audio
+        # For now return the speaker list
+        return {"message": "Use CLI 'deskvoice enroll' for voice enrollment"}
+
+    @app.put("/api/speakers/{speaker_id}")
+    async def update_speaker(speaker_id: int, request: Request):
+        body = await request.json()
+        name = body.get("name", "")
+        if name:
+            db.update_speaker_name(speaker_id, name)
+        return {"ok": True}
+
+    # --- Task management endpoints ---
+    @app.put("/api/tasks/{task_id}")
+    async def update_task(task_id: int, request: Request):
+        body = await request.json()
+        db.update_task(
+            task_id,
+            description=body.get("description"),
+            assignee=body.get("assignee"),
+            priority=body.get("priority"),
+            due_hint=body.get("due_hint"),
+            reminder_at=body.get("reminder_at"),
+        )
+        broadcast_event("task_updated", {"task_id": task_id, **body})
+        return {"ok": True}
+
+    @app.post("/api/tasks/{task_id}/remind")
+    async def set_reminder(task_id: int, request: Request):
+        body = await request.json()
+        reminder_at = body.get("reminder_at", "")
+        db.update_task(task_id, reminder_at=reminder_at)
+        return {"ok": True, "reminder_at": reminder_at}
+
     # --- HTML frontend ---
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -273,6 +318,29 @@ function addTag(tag) {
   list.appendChild(el);
 }
 
+function handleStreamToken(token) {
+  const feed = $('transcript-feed');
+  if (feed.querySelector('.empty')) feed.innerHTML = '';
+  let streaming = document.getElementById('streaming-entry');
+  if (!streaming) {
+    streaming = document.createElement('div');
+    streaming.id = 'streaming-entry';
+    streaming.className = 'transcript-entry';
+    streaming.innerHTML = '<div class="time">' + new Date().toLocaleTimeString() + '</div><div class="text" id="streaming-text"></div>';
+    feed.appendChild(streaming);
+  }
+  const textEl = document.getElementById('streaming-text');
+  if (textEl) textEl.textContent += token;
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function handleStreamComplete() {
+  const el = document.getElementById('streaming-entry');
+  if (el) el.removeAttribute('id');
+  const textEl = document.getElementById('streaming-text');
+  if (textEl) textEl.removeAttribute('id');
+}
+
 function markDone(taskId) {
   fetch('/api/tasks/' + taskId + '/done', { method: 'POST' })
     .then(() => {
@@ -330,6 +398,12 @@ function connectSSE() {
       case 'session_started':
         break;
       case 'session_ended':
+        break;
+      case 'stream_token':
+        handleStreamToken(d.token || '');
+        break;
+      case 'stream_complete':
+        handleStreamComplete();
         break;
       case 'task_completed':
         const el = document.getElementById('task-' + d.task_id);

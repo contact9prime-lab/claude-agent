@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     due_hint TEXT DEFAULT '',
     completed INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
+    reminder_at TEXT DEFAULT '',
+    edited_at TEXT DEFAULT '',
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
 
@@ -57,6 +59,13 @@ CREATE TABLE IF NOT EXISTS hashtags (
     tag TEXT NOT NULL,
     context TEXT DEFAULT '',
     FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
+CREATE TABLE IF NOT EXISTS speakers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    voice_embedding BLOB NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
@@ -73,6 +82,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
 );
 """
 
+MIGRATIONS = [
+    # Add reminder_at and edited_at to tasks if missing
+    ("ALTER TABLE tasks ADD COLUMN reminder_at TEXT DEFAULT ''", "tasks", "reminder_at"),
+    ("ALTER TABLE tasks ADD COLUMN edited_at TEXT DEFAULT ''", "tasks", "edited_at"),
+    # Add speakers table (handled by schema, but migration for existing DBs)
+]
+
 
 class Database:
     """Local SQLite database for the desk voice agent."""
@@ -88,7 +104,22 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent access
         self._conn.executescript(SCHEMA)
+        self._run_migrations()
         logger.info("Database connected: %s", self.db_path)
+
+    def _run_migrations(self) -> None:
+        """Run schema migrations for existing databases."""
+        for sql, table, column in MIGRATIONS:
+            try:
+                # Check if column exists
+                cursor = self._conn.execute(f"PRAGMA table_info({table})")
+                columns = [row[1] for row in cursor.fetchall()]
+                if column not in columns:
+                    self._conn.execute(sql)
+                    self._conn.commit()
+                    logger.info("Migration: added %s.%s", table, column)
+            except Exception as e:
+                logger.debug("Migration skipped: %s", e)
 
     def close(self) -> None:
         if self._conn:
@@ -207,6 +238,62 @@ class Database:
         )
         self.conn.commit()
 
+    def update_task(
+        self,
+        task_id: int,
+        description: Optional[str] = None,
+        assignee: Optional[str] = None,
+        priority: Optional[str] = None,
+        due_hint: Optional[str] = None,
+        reminder_at: Optional[str] = None,
+    ) -> None:
+        """Update task fields."""
+        updates = []
+        params = []
+        if description is not None:
+            updates.append("description = ?")
+            params.append(description)
+        if assignee is not None:
+            updates.append("assignee = ?")
+            params.append(assignee)
+        if priority is not None:
+            updates.append("priority = ?")
+            params.append(priority)
+        if due_hint is not None:
+            updates.append("due_hint = ?")
+            params.append(due_hint)
+        if reminder_at is not None:
+            updates.append("reminder_at = ?")
+            params.append(reminder_at)
+        if not updates:
+            return
+        updates.append("edited_at = ?")
+        params.append(datetime.now().isoformat())
+        params.append(task_id)
+        self.conn.execute(
+            f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?", params
+        )
+        self.conn.commit()
+
+    def get_task(self, task_id: int) -> Optional[dict]:
+        """Get a single task by ID."""
+        row = self.conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_due_reminders(self) -> list[dict]:
+        """Get tasks with reminders that are due now."""
+        now = datetime.now().isoformat()
+        rows = self.conn.execute(
+            "SELECT * FROM tasks WHERE reminder_at != '' AND reminder_at <= ? AND completed = 0",
+            (now,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_reminder(self, task_id: int) -> None:
+        """Clear a task's reminder after it fires."""
+        self.conn.execute("UPDATE tasks SET reminder_at = '' WHERE id = ?", (task_id,))
+        self.conn.commit()
+
     def list_tasks(self, pending_only: bool = True, limit: int = 50) -> list[dict]:
         """List tasks, optionally filtering to pending only."""
         query = "SELECT t.*, s.title as session_title FROM tasks t LEFT JOIN sessions s ON t.session_id = s.id"
@@ -250,6 +337,43 @@ class Database:
             (tag,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Speakers
+    # ------------------------------------------------------------------
+
+    def add_speaker(self, name: str, embedding: bytes) -> int:
+        """Add a speaker with their voice embedding."""
+        cursor = self.conn.execute(
+            "INSERT INTO speakers (name, voice_embedding, created_at) VALUES (?, ?, ?)",
+            (name, embedding, datetime.now().isoformat()),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def list_speakers(self) -> list[dict]:
+        """List all enrolled speakers."""
+        rows = self.conn.execute(
+            "SELECT id, name, created_at FROM speakers ORDER BY name"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_speaker_embeddings(self) -> list[tuple[int, str, bytes]]:
+        """Get all speaker embeddings for matching."""
+        rows = self.conn.execute(
+            "SELECT id, name, voice_embedding FROM speakers"
+        ).fetchall()
+        return [(r["id"], r["name"], r["voice_embedding"]) for r in rows]
+
+    def update_speaker_name(self, speaker_id: int, name: str) -> None:
+        """Rename a speaker."""
+        self.conn.execute("UPDATE speakers SET name = ? WHERE id = ?", (name, speaker_id))
+        self.conn.commit()
+
+    def delete_speaker(self, speaker_id: int) -> None:
+        """Delete a speaker profile."""
+        self.conn.execute("DELETE FROM speakers WHERE id = ?", (speaker_id,))
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # Search

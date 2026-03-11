@@ -59,6 +59,16 @@ Rules:
 """
 
 
+class StreamCallback:
+    """Callback for receiving streaming transcript tokens."""
+
+    def on_token(self, token: str) -> None:
+        """Called for each token as it arrives."""
+
+    def on_complete(self, full_text: str) -> None:
+        """Called when the full response is complete."""
+
+
 class LLMProvider(ABC):
     """Base class for LLM providers."""
 
@@ -68,6 +78,19 @@ class LLMProvider(ABC):
     @abstractmethod
     def transcribe_and_extract(self, chunk: AudioChunk) -> Insight:
         """Send audio to the LLM and get back structured insights."""
+
+    def stream_transcribe(
+        self, chunk: AudioChunk, callback: Optional[StreamCallback] = None
+    ) -> Insight:
+        """Stream transcription with real-time token callbacks.
+
+        Default implementation falls back to non-streaming.
+        Providers can override for true streaming.
+        """
+        insight = self.transcribe_and_extract(chunk)
+        if callback and insight.transcript:
+            callback.on_complete(insight.transcript)
+        return insight
 
     @staticmethod
     def _try_recover_json(text: str) -> Optional[dict]:
@@ -227,6 +250,57 @@ class GeminiProvider(LLMProvider):
         insight = self._parse_response(response.text)
 
         usage = getattr(response, "usage_metadata", None)
+        if usage:
+            insight.token_usage = TokenUsage(
+                input_tokens=getattr(usage, "prompt_token_count", 0) or 0,
+                output_tokens=getattr(usage, "candidates_token_count", 0) or 0,
+                total_tokens=getattr(usage, "total_token_count", 0) or 0,
+            )
+
+        return insight
+
+    def stream_transcribe(
+        self, chunk: AudioChunk, callback: Optional[StreamCallback] = None
+    ) -> Insight:
+        """Stream transcription from Gemini with real-time callbacks."""
+        if callback is None:
+            return self.transcribe_and_extract(chunk)
+
+        from google.genai import types
+
+        client = self._get_client()
+        logger.info("Streaming %.1fs audio to Gemini %s", chunk.duration_seconds, self.config.model)
+
+        response_stream = client.models.generate_content_stream(
+            model=self.config.model,
+            contents=[
+                types.Content(
+                    parts=[
+                        types.Part.from_bytes(data=chunk.audio_data, mime_type="audio/wav"),
+                        types.Part.from_text(text=TRANSCRIBE_AND_EXTRACT_PROMPT),
+                    ]
+                )
+            ],
+            config=types.GenerateContentConfig(
+                temperature=self.config.temperature,
+                max_output_tokens=8192,
+                response_mime_type="application/json",
+            ),
+        )
+
+        full_text = ""
+        usage = None
+        for response_chunk in response_stream:
+            if response_chunk.text:
+                full_text += response_chunk.text
+                callback.on_token(response_chunk.text)
+            u = getattr(response_chunk, "usage_metadata", None)
+            if u:
+                usage = u
+
+        callback.on_complete(full_text)
+
+        insight = self._parse_response(full_text)
         if usage:
             insight.token_usage = TokenUsage(
                 input_tokens=getattr(usage, "prompt_token_count", 0) or 0,

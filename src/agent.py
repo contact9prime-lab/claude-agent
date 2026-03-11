@@ -28,11 +28,12 @@ from typing import Optional
 import numpy as np
 
 from src.capture.audio_stream import AudioStream
+from src.capture.notifier import play_beep
 from src.capture.vad import SileroVAD
 from src.config import AgentConfig
 from src.models.models import AudioChunk, AudioType
 from src.processing.classifier import classify_audio
-from src.processing.llm_provider import create_provider
+from src.processing.llm_provider import StreamCallback, create_provider
 from src.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ class DeskVoiceAgent:
         self._running = False
         self._current_session_id: Optional[int] = None
         self._last_speech_time: Optional[datetime] = None
+        self._tui = None  # Optional TUI reference for pushing updates
         self._stats = {
             "chunks_processed": 0,
             "speech_seconds": 0.0,
@@ -91,6 +93,9 @@ class DeskVoiceAgent:
         self._running = True
 
         logger.info("DeskVoice agent running. Listening for speech...")
+
+        # Start background reminder checker
+        self._start_reminder_checker()
 
         try:
             self._main_loop()
@@ -154,19 +159,17 @@ class DeskVoiceAgent:
             wav_audio = self._wav_to_numpy(chunk.audio_data)
             local_type = classify_audio(wav_audio, chunk.sample_rate)
 
-            if local_type == AudioType.MUSIC:
-                logger.debug("Skipping music chunk (%.1fs)", chunk.duration_seconds)
-                return
-            if local_type == AudioType.SILENCE:
-                logger.debug("Skipping silence chunk")
-                return
-            if local_type == AudioType.NOISE:
-                logger.debug("Skipping noise chunk (%.1fs)", chunk.duration_seconds)
+            if local_type in (AudioType.MUSIC, AudioType.SILENCE, AudioType.NOISE):
+                logger.debug("Skipping %s chunk (%.1fs)", local_type.value, chunk.duration_seconds)
                 return
 
         # Step 2: Send to LLM for transcription + insight extraction
+        if chunk.duration_seconds >= 60:
+            play_beep()
+
         try:
-            insight = self._llm.transcribe_and_extract(chunk)
+            callback = self._make_stream_callback()
+            insight = self._llm.stream_transcribe(chunk, callback=callback)
             self._stats["gemini_calls"] += 1
         except Exception as e:
             logger.error("LLM processing failed: %s", e)
@@ -192,6 +195,9 @@ class DeskVoiceAgent:
         if insight.audio_type in (AudioType.MUSIC, AudioType.NOISE):
             logger.info("Gemini classified as %s, skipping storage", insight.audio_type.value)
             return
+
+        # Step 3b: Try to identify speakers using enrolled profiles
+        self._tag_speakers(insight, chunk)
 
         # Step 4: Store everything
         self._db.save_insight(insight, self._current_session_id)
@@ -225,8 +231,15 @@ class DeskVoiceAgent:
             tags = ", ".join(f"#{h.tag}" for h in insight.hashtags)
             logger.info("[tags] %s", tags)
 
-        # Broadcast to web UI
+        # Broadcast to web UI and TUI
         self._broadcast_insight(insight, chunk)
+
+        # Push to TUI if attached
+        if self._tui:
+            try:
+                self._tui.push_insight(insight, chunk.duration_seconds)
+            except Exception:
+                pass
 
     def _broadcast_insight(self, insight, chunk: AudioChunk) -> None:
         """Send insight data to connected web UI clients."""
@@ -320,6 +333,100 @@ class DeskVoiceAgent:
                 self._current_session_id,
             )
             self._end_session()
+
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
+    def _make_stream_callback(self) -> StreamCallback:
+        """Create a streaming callback that broadcasts partial tokens."""
+        agent = self
+
+        class _Callback(StreamCallback):
+            def on_token(self, token: str) -> None:
+                try:
+                    from src.web.app import broadcast_event
+                    broadcast_event("stream_token", {"token": token})
+                except Exception:
+                    pass
+                if agent._tui:
+                    try:
+                        agent._tui.call_from_thread(
+                            agent._tui.query_one("#transcript-panel").write, token
+                        )
+                    except Exception:
+                        pass
+
+            def on_complete(self, full_text: str) -> None:
+                try:
+                    from src.web.app import broadcast_event
+                    broadcast_event("stream_complete", {"text": full_text})
+                except Exception:
+                    pass
+
+        return _Callback()
+
+    # ------------------------------------------------------------------
+    # Speaker identification
+    # ------------------------------------------------------------------
+
+    def _tag_speakers(self, insight, chunk: AudioChunk) -> None:
+        """Replace generic speaker labels with real names if enrolled."""
+        try:
+            from src.processing.speaker_id import identify_speaker
+            known = self._db.get_speaker_embeddings()
+            if not known:
+                return
+            name = identify_speaker(chunk.audio_data, known)
+            if name and insight.segments:
+                for seg in insight.segments:
+                    if seg.speaker and seg.speaker.startswith("Speaker"):
+                        seg.speaker = name
+                # Also fix the transcript text
+                if insight.transcript:
+                    for i in range(1, 10):
+                        if f"Speaker {i}" in insight.transcript:
+                            insight.transcript = insight.transcript.replace(
+                                f"Speaker {i}", name, 1
+                            )
+                            break
+        except ImportError:
+            pass  # resemblyzer not installed
+        except Exception as e:
+            logger.debug("Speaker ID failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Reminders
+    # ------------------------------------------------------------------
+
+    def _start_reminder_checker(self) -> None:
+        """Start a background thread that checks for due reminders."""
+        def _check_loop():
+            while self._running:
+                try:
+                    due = self._db.get_due_reminders()
+                    for task in due:
+                        logger.info(
+                            "[reminder] Task #%d: %s",
+                            task["id"],
+                            task["description"],
+                        )
+                        play_beep(freq=660, duration_ms=200)
+                        try:
+                            from src.web.app import broadcast_event
+                            broadcast_event("reminder", {
+                                "task_id": task["id"],
+                                "description": task["description"],
+                            })
+                        except Exception:
+                            pass
+                        self._db.clear_reminder(task["id"])
+                except Exception as e:
+                    logger.debug("Reminder check failed: %s", e)
+                time.sleep(30)  # Check every 30 seconds
+
+        thread = threading.Thread(target=_check_loop, daemon=True)
+        thread.start()
 
     # ------------------------------------------------------------------
     # Helpers

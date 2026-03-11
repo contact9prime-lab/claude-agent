@@ -261,6 +261,54 @@ def tags() -> None:
 
 
 @cli.command()
+def speakers() -> None:
+    """List enrolled speaker voice profiles."""
+    config = AgentConfig()
+    db = Database(config.storage.db_path)
+    db.connect()
+
+    speaker_list = db.list_speakers()
+    if not speaker_list:
+        console.print("[dim]No speakers enrolled yet. Use 'deskvoice enroll <name>' to add one.[/dim]")
+        return
+
+    table = Table(title="Speaker Profiles")
+    table.add_column("ID", style="cyan", width=5)
+    table.add_column("Name", style="yellow")
+    table.add_column("Enrolled")
+
+    for s in speaker_list:
+        table.add_row(str(s["id"]), s["name"], s["created_at"][:19])
+
+    console.print(table)
+    db.close()
+
+
+@cli.command()
+@click.argument("name")
+@click.option("--duration", default=10, help="Recording duration in seconds")
+def enroll(name: str, duration: int) -> None:
+    """Enroll a speaker by recording a voice sample."""
+    from src.processing.speaker_id import extract_embedding, record_enrollment_audio
+
+    config = AgentConfig()
+    db = Database(config.storage.db_path)
+    db.connect()
+
+    console.print(f"[bold]Enrolling speaker: {name}[/bold]")
+    console.print(f"Please speak naturally for {duration} seconds...")
+    console.print("[yellow]Recording starts now![/yellow]")
+
+    audio = record_enrollment_audio(duration_sec=duration)
+    console.print("[green]Recording complete. Processing...[/green]")
+
+    embedding = extract_embedding(audio)
+    speaker_id = db.add_speaker(name, embedding)
+    console.print(f"[bold green]Speaker '{name}' enrolled (ID: {speaker_id})[/bold green]")
+    db.close()
+
+
+@cli.command()
 @click.option("--device", type=int, default=None, help="Audio device index")
 @click.option("--mic", is_flag=True, help="Use default microphone")
 @click.option("--port", default=8765, help="Web UI port")
@@ -313,6 +361,34 @@ def ui(device: int | None, mic: bool, port: int, no_listen: bool) -> None:
     finally:
         if agent:
             agent.stop()
+
+
+@cli.command("tui")
+@click.option("--device", type=int, default=None, help="Audio device index")
+@click.option("--mic", is_flag=True, help="Use default microphone")
+@click.option("--no-listen", is_flag=True, help="TUI only, no audio capture")
+def tui_cmd(device: int | None, mic: bool, no_listen: bool) -> None:
+    """Start the terminal UI (like Claude Code)."""
+    from src.tui.app import DeskVoiceTUI
+
+    config = AgentConfig()
+
+    errors = config.validate()
+    if not no_listen and errors:
+        for e in errors:
+            console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    agent = None
+    if not no_listen:
+        if device is None and not mic:
+            bh = find_blackhole_device()
+            if bh is not None:
+                device = bh
+        agent = DeskVoiceAgent(config, device=device)
+
+    app = DeskVoiceTUI(config=config, agent=agent)
+    app.run()
 
 
 @cli.command()
