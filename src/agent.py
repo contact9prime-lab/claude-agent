@@ -57,6 +57,8 @@ class DeskVoiceAgent:
 
         # State
         self._running = False
+        self._paused = False  # Recording pause state
+        self._recording_start_time: Optional[datetime] = None  # When recording started
         self._current_session_id: Optional[int] = None
         self._last_speech_time: Optional[datetime] = None
         self._tui = None  # Optional TUI reference for pushing updates
@@ -92,6 +94,7 @@ class DeskVoiceAgent:
         self._audio.start()
         self._running = True
 
+        self._recording_start_time = datetime.now()
         logger.info("DeskVoice agent running. Listening for speech...")
 
         # Start background reminder checker
@@ -124,6 +127,41 @@ class DeskVoiceAgent:
         self._db.close()
         logger.info("DeskVoice agent stopped. Stats: %s", self._stats)
 
+    def pause(self) -> None:
+        """Pause recording (stops processing audio, keeps agent alive)."""
+        if not self._paused:
+            self._paused = True
+            logger.info("Recording paused")
+            try:
+                from src.web.app import broadcast_event
+                broadcast_event("recording_state", {"state": "paused"})
+            except Exception:
+                pass
+
+    def resume(self) -> None:
+        """Resume recording after pause."""
+        if self._paused:
+            self._paused = False
+            self._recording_start_time = datetime.now()
+            logger.info("Recording resumed")
+            try:
+                from src.web.app import broadcast_event
+                broadcast_event("recording_state", {"state": "recording"})
+            except Exception:
+                pass
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    @property
+    def is_recording(self) -> bool:
+        return self._running and not self._paused
+
+    @property
+    def recording_start_time(self) -> Optional[datetime]:
+        return self._recording_start_time
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -131,6 +169,12 @@ class DeskVoiceAgent:
     def _main_loop(self) -> None:
         """Core audio processing loop."""
         while self._running:
+            # If paused, just drain the audio buffer without processing
+            if self._paused:
+                self._audio.read(timeout=1.0)
+                time.sleep(0.1)
+                continue
+
             # Read audio frame from capture
             frame = self._audio.read(timeout=1.0)
             if frame is None:
@@ -199,12 +243,24 @@ class DeskVoiceAgent:
         # Step 3b: Try to identify speakers using enrolled profiles
         self._tag_speakers(insight, chunk)
 
-        # Step 4: Store everything
+        # Step 4: Save audio file for playback
+        audio_filename = self._save_audio_chunk(chunk)
+
+        # Step 5: Store everything
         self._db.save_insight(insight, self._current_session_id)
         self._db.append_transcript(
             self._current_session_id,
             insight.transcript,
             chunk.duration_seconds,
+        )
+
+        # Save recording entry for playback
+        self._db.add_recording(
+            session_id=self._current_session_id,
+            filename=audio_filename,
+            duration_seconds=chunk.duration_seconds,
+            transcript=insight.transcript or "",
+            summary=insight.summary or "",
         )
 
         self._stats["chunks_processed"] += 1
@@ -264,6 +320,7 @@ class DeskVoiceAgent:
                     "total_tokens": insight.token_usage.total_tokens,
                 } if insight.token_usage else None,
                 "duration_seconds": chunk.duration_seconds,
+                "audio_file": getattr(chunk, '_saved_filename', None),
             })
         except Exception:
             pass  # Web UI not running
@@ -432,12 +489,14 @@ class DeskVoiceAgent:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _save_audio_chunk(self, chunk: AudioChunk) -> None:
-        """Save an audio chunk to disk for later reprocessing."""
+    def _save_audio_chunk(self, chunk: AudioChunk) -> str:
+        """Save an audio chunk to disk. Returns the filename."""
         timestamp = chunk.timestamp_start.strftime("%Y%m%d_%H%M%S")
-        path = self.config.storage.audio_dir / f"chunk_{timestamp}.wav"
+        filename = f"chunk_{timestamp}.wav"
+        path = self.config.storage.audio_dir / filename
         path.write_bytes(chunk.audio_data)
-        logger.info("Saved audio chunk for later: %s", path)
+        logger.info("Saved audio chunk: %s", path)
+        return filename
 
     @staticmethod
     def _wav_to_numpy(wav_bytes: bytes) -> np.ndarray:

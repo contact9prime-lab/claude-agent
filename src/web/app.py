@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.config import AgentConfig
@@ -119,6 +119,51 @@ def create_app(config: AgentConfig) -> FastAPI:
             db.update_speaker_name(speaker_id, name)
         return {"ok": True}
 
+    # --- Recording control endpoints ---
+    @app.post("/api/recording/pause")
+    def pause_recording():
+        if _agent_ref:
+            _agent_ref.pause()
+            return {"ok": True, "state": "paused"}
+        return {"ok": False, "error": "Agent not available"}
+
+    @app.post("/api/recording/resume")
+    def resume_recording():
+        if _agent_ref:
+            _agent_ref.resume()
+            return {"ok": True, "state": "recording"}
+        return {"ok": False, "error": "Agent not available"}
+
+    @app.get("/api/recording/state")
+    def recording_state():
+        if _agent_ref:
+            state = "paused" if _agent_ref.is_paused else "recording"
+            start_time = _agent_ref.recording_start_time
+            return {
+                "state": state,
+                "start_time": start_time.isoformat() if start_time else None,
+            }
+        return {"state": "stopped", "start_time": None}
+
+    # --- Recordings (playback) endpoints ---
+    @app.get("/api/recordings")
+    def get_recordings(limit: int = 50):
+        return db.list_recordings(limit=limit)
+
+    @app.get("/api/recordings/{recording_id}")
+    def get_recording(recording_id: int):
+        return db.get_recording(recording_id)
+
+    @app.get("/api/recordings/{recording_id}/audio")
+    def get_recording_audio(recording_id: int):
+        rec = db.get_recording(recording_id)
+        if not rec:
+            return {"error": "Recording not found"}
+        audio_path = config.storage.audio_dir / rec["filename"]
+        if not audio_path.exists():
+            return {"error": "Audio file not found"}
+        return FileResponse(audio_path, media_type="audio/wav", filename=rec["filename"])
+
     # --- Task management endpoints ---
     @app.put("/api/tasks/{task_id}")
     async def update_task(task_id: int, request: Request):
@@ -149,8 +194,15 @@ def create_app(config: AgentConfig) -> FastAPI:
     return app
 
 
-# Store agent stats for the API
+# Store agent stats and reference for the API
 _agent_stats: dict = {}
+_agent_ref = None  # Reference to the DeskVoiceAgent instance
+
+
+def set_agent_ref(agent) -> None:
+    """Set the agent reference for recording control."""
+    global _agent_ref
+    _agent_ref = agent
 
 
 DASHBOARD_HTML = """\
@@ -165,34 +217,63 @@ DASHBOARD_HTML = """\
     --bg: #0f0f0f; --surface: #1a1a2e; --surface2: #16213e;
     --accent: #0f3460; --text: #e0e0e0; --text-dim: #888;
     --green: #4ecca3; --yellow: #f0c929; --red: #e74c3c; --blue: #3498db;
+    --orange: #e67e22;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: 'SF Mono', 'Fira Code', monospace; background: var(--bg); color: var(--text); }
-  .container { max-width: 1200px; margin: 0 auto; padding: 16px; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 16px; }
   header { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--accent); margin-bottom: 16px; }
   header h1 { font-size: 1.4em; color: var(--green); }
+  .header-right { display: flex; align-items: center; gap: 16px; }
   .status { display: flex; gap: 16px; font-size: 0.85em; color: var(--text-dim); }
   .status .live { color: var(--green); animation: pulse 2s infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .grid { display: grid; grid-template-columns: 1fr 350px; gap: 16px; }
-  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+
+  /* Recording controls */
+  .rec-controls { display: flex; align-items: center; gap: 12px; }
+  .rec-btn { width: 44px; height: 44px; border-radius: 50%; border: 2px solid var(--accent); background: var(--surface); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
+  .rec-btn:hover { border-color: var(--green); transform: scale(1.05); }
+  .rec-btn.recording { border-color: var(--red); animation: rec-pulse 1.5s infinite; }
+  .rec-btn.recording .rec-icon { background: var(--red); }
+  .rec-btn.paused { border-color: var(--yellow); }
+  .rec-btn.paused .rec-icon { background: var(--yellow); border-radius: 2px; width: 14px; height: 14px; }
+  .rec-icon { width: 16px; height: 16px; border-radius: 50%; background: var(--green); transition: all 0.2s; }
+  @keyframes rec-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.4); } 50% { box-shadow: 0 0 0 8px rgba(231, 76, 60, 0); } }
+  .rec-timer { font-size: 1.3em; font-weight: bold; font-variant-numeric: tabular-nums; min-width: 80px; color: var(--text); }
+  .rec-timer.active { color: var(--red); }
+  .rec-timer.paused { color: var(--yellow); }
+  .rec-label { font-size: 0.75em; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 2px; margin-bottom: 16px; background: var(--surface); border-radius: 8px; padding: 3px; }
+  .tab { padding: 8px 16px; border: none; background: transparent; color: var(--text-dim); cursor: pointer; border-radius: 6px; font-family: inherit; font-size: 0.85em; transition: all 0.2s; }
+  .tab:hover { color: var(--text); background: var(--surface2); }
+  .tab.active { color: var(--green); background: var(--accent); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  .grid { display: grid; grid-template-columns: 1fr 380px; gap: 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
   .card { background: var(--surface); border: 1px solid var(--accent); border-radius: 8px; padding: 16px; margin-bottom: 12px; }
-  .card h2 { font-size: 0.9em; color: var(--green); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .card h2 { font-size: 0.9em; color: var(--green); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; display: flex; justify-content: space-between; align-items: center; }
+  .card h2 .count { color: var(--text-dim); font-size: 0.9em; }
   .transcript-entry { padding: 8px 0; border-bottom: 1px solid #ffffff10; }
   .transcript-entry .time { color: var(--text-dim); font-size: 0.75em; }
   .transcript-entry .text { margin-top: 4px; line-height: 1.5; }
   .transcript-entry .summary { color: var(--blue); font-size: 0.85em; margin-top: 4px; font-style: italic; }
   .task-item { display: flex; align-items: flex-start; gap: 8px; padding: 8px 0; border-bottom: 1px solid #ffffff10; }
-  .task-item .priority { font-size: 0.7em; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+  .task-item .priority { font-size: 0.7em; padding: 2px 6px; border-radius: 4px; font-weight: bold; flex-shrink: 0; }
   .task-item .priority.high { background: var(--red); color: white; }
   .task-item .priority.medium { background: var(--yellow); color: black; }
   .task-item .priority.low { background: var(--accent); color: var(--text); }
   .task-item .desc { flex: 1; }
   .task-item .assignee { color: var(--yellow); font-size: 0.85em; }
   .task-item .due { color: var(--text-dim); font-size: 0.8em; }
-  .task-item button { background: var(--green); border: none; color: black; padding: 3px 8px; border-radius: 4px; cursor: pointer; font-size: 0.75em; }
-  .tag { display: inline-block; background: var(--accent); color: var(--blue); padding: 2px 8px; border-radius: 12px; font-size: 0.8em; margin: 2px; }
-  .token-bar { display: flex; gap: 16px; font-size: 0.85em; }
+  .task-item button { background: var(--green); border: none; color: black; padding: 3px 8px; border-radius: 4px; cursor: pointer; font-size: 0.75em; flex-shrink: 0; }
+  .task-item button:hover { opacity: 0.8; }
+  .tag { display: inline-block; background: var(--accent); color: var(--blue); padding: 3px 10px; border-radius: 12px; font-size: 0.8em; margin: 3px; cursor: default; }
+  .tag:hover { background: var(--surface2); }
+  .token-bar { display: flex; gap: 16px; font-size: 0.85em; flex-wrap: wrap; }
   .token-bar span { color: var(--text-dim); }
   .token-bar .val { color: var(--green); font-weight: bold; }
   .decision { color: var(--green); padding: 4px 0; font-size: 0.9em; }
@@ -202,63 +283,231 @@ DASHBOARD_HTML = """\
   #transcript-feed { max-height: 500px; overflow-y: auto; }
   #tasks-list { max-height: 400px; overflow-y: auto; }
   .empty { color: var(--text-dim); font-style: italic; font-size: 0.85em; padding: 20px 0; text-align: center; }
-  .session-info { font-size: 0.8em; color: var(--text-dim); margin-bottom: 8px; }
+
+  /* Recordings list */
+  .recording-item { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #ffffff10; }
+  .recording-item .rec-play-btn { width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--green); background: transparent; color: var(--green); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 0.2s; }
+  .recording-item .rec-play-btn:hover { background: var(--green); color: black; }
+  .recording-item .rec-play-btn.playing { border-color: var(--red); color: var(--red); }
+  .recording-item .rec-play-btn.playing:hover { background: var(--red); color: white; }
+  .recording-item .rec-info { flex: 1; min-width: 0; }
+  .recording-item .rec-info .rec-time { font-size: 0.75em; color: var(--text-dim); }
+  .recording-item .rec-info .rec-transcript { font-size: 0.85em; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .recording-item .rec-info .rec-summary { font-size: 0.8em; color: var(--blue); font-style: italic; }
+  .recording-item .rec-duration { color: var(--text-dim); font-size: 0.8em; flex-shrink: 0; }
+  #recordings-list { max-height: 500px; overflow-y: auto; }
+
+  /* Audio player bar */
+  .audio-player-bar { display: none; background: var(--surface2); border: 1px solid var(--accent); border-radius: 8px; padding: 10px 16px; margin-bottom: 12px; align-items: center; gap: 12px; }
+  .audio-player-bar.visible { display: flex; }
+  .audio-player-bar .player-btn { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--green); background: transparent; color: var(--green); cursor: pointer; display: flex; align-items: center; justify-content: center; }
+  .audio-player-bar .player-btn:hover { background: var(--green); color: black; }
+  .audio-player-bar .player-info { flex: 1; font-size: 0.85em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .audio-player-bar .player-time { font-size: 0.8em; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .audio-player-bar .player-progress { flex: 2; height: 4px; background: var(--accent); border-radius: 2px; cursor: pointer; position: relative; }
+  .audio-player-bar .player-progress-fill { height: 100%; background: var(--green); border-radius: 2px; width: 0; transition: width 0.1s; }
+  .audio-player-bar .player-close { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 1.1em; padding: 4px; }
+  .audio-player-bar .player-close:hover { color: var(--text); }
+
+  /* Speakers / voiceprint section */
+  .speaker-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #ffffff10; }
+  .speaker-item .speaker-avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: var(--blue); display: flex; align-items: center; justify-content: center; font-size: 0.85em; font-weight: bold; flex-shrink: 0; }
+  .speaker-item .speaker-info { flex: 1; }
+  .speaker-item .speaker-name { font-size: 0.9em; }
+  .speaker-item .speaker-date { font-size: 0.75em; color: var(--text-dim); }
+  .speaker-item .speaker-actions { display: flex; gap: 4px; }
+  .speaker-item .speaker-actions button { background: var(--accent); border: none; color: var(--text-dim); padding: 3px 8px; border-radius: 4px; cursor: pointer; font-size: 0.75em; font-family: inherit; }
+  .speaker-item .speaker-actions button:hover { color: var(--text); background: var(--surface2); }
+  #speakers-list { max-height: 300px; overflow-y: auto; }
+  .speaker-enroll-hint { font-size: 0.8em; color: var(--text-dim); margin-top: 8px; padding: 8px; background: var(--surface2); border-radius: 6px; }
 </style>
 </head>
 <body>
 <div class="container">
   <header>
     <h1>DeskVoice</h1>
-    <div class="status">
-      <span id="connection" class="live">&#9679; Connected</span>
-      <span id="provider-info"></span>
+    <div class="header-right">
+      <div class="rec-controls">
+        <div class="rec-label" id="rec-label">Recording</div>
+        <button class="rec-btn recording" id="rec-btn" onclick="toggleRecording()" title="Pause/Resume recording">
+          <div class="rec-icon"></div>
+        </button>
+        <div class="rec-timer active" id="rec-timer">00:00</div>
+      </div>
+      <div class="status">
+        <span id="connection" class="live">&#9679; Connected</span>
+      </div>
     </div>
   </header>
 
-  <div class="card">
-    <h2>Token Usage</h2>
-    <div class="token-bar">
-      <span>Input: <span class="val" id="tokens-in">0</span></span>
-      <span>Output: <span class="val" id="tokens-out">0</span></span>
-      <span>Total: <span class="val" id="tokens-total">0</span></span>
-      <span>Chunks: <span class="val" id="chunks-count">0</span></span>
-      <span>Speech: <span class="val" id="speech-secs">0s</span></span>
+  <!-- Audio player bar (shown when playing a recording) -->
+  <div class="audio-player-bar" id="audio-player-bar">
+    <button class="player-btn" id="player-play-btn" onclick="togglePlayer()">&#9654;</button>
+    <span class="player-info" id="player-info">-</span>
+    <span class="player-time" id="player-current-time">0:00</span>
+    <div class="player-progress" id="player-progress" onclick="seekPlayer(event)">
+      <div class="player-progress-fill" id="player-progress-fill"></div>
+    </div>
+    <span class="player-time" id="player-total-time">0:00</span>
+    <button class="player-close" onclick="closePlayer()">&#10005;</button>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('dashboard')">Dashboard</button>
+    <button class="tab" onclick="switchTab('recordings')">Recordings</button>
+    <button class="tab" onclick="switchTab('speakers')">Speakers</button>
+  </div>
+
+  <!-- Dashboard tab -->
+  <div class="tab-content active" id="tab-dashboard">
+    <div class="card">
+      <h2>Token Usage</h2>
+      <div class="token-bar">
+        <span>Input: <span class="val" id="tokens-in">0</span></span>
+        <span>Output: <span class="val" id="tokens-out">0</span></span>
+        <span>Total: <span class="val" id="tokens-total">0</span></span>
+        <span>Chunks: <span class="val" id="chunks-count">0</span></span>
+        <span>Speech: <span class="val" id="speech-secs">0s</span></span>
+      </div>
+    </div>
+    <div class="grid">
+      <div>
+        <div class="card">
+          <h2>Live Transcript</h2>
+          <div id="transcript-feed"><div class="empty">Waiting for speech...</div></div>
+        </div>
+        <div class="card">
+          <h2>Decisions & Questions</h2>
+          <div id="decisions-feed"><div class="empty">None yet</div></div>
+        </div>
+      </div>
+      <div>
+        <div class="card">
+          <h2>Tasks <span class="count" id="tasks-count"></span></h2>
+          <div id="tasks-list"><div class="empty">No tasks yet</div></div>
+        </div>
+        <div class="card">
+          <h2>Tags <span class="count" id="tags-count"></span></h2>
+          <div id="tags-list"><div class="empty">No tags yet</div></div>
+        </div>
+      </div>
     </div>
   </div>
 
-  <div class="grid">
-    <div>
-      <div class="card">
-        <h2>Live Transcript</h2>
-        <div id="transcript-feed"><div class="empty">Waiting for speech...</div></div>
-      </div>
-      <div class="card">
-        <h2>Decisions & Questions</h2>
-        <div id="decisions-feed"><div class="empty">None yet</div></div>
-      </div>
+  <!-- Recordings tab -->
+  <div class="tab-content" id="tab-recordings">
+    <div class="card">
+      <h2>Recordings <span class="count" id="rec-count"></span></h2>
+      <div id="recordings-list"><div class="empty">No recordings yet</div></div>
     </div>
-    <div>
-      <div class="card">
-        <h2>Tasks</h2>
-        <div id="tasks-list"><div class="empty">No tasks yet</div></div>
-      </div>
-      <div class="card">
-        <h2>Tags</h2>
-        <div id="tags-list"><div class="empty">No tags yet</div></div>
+  </div>
+
+  <!-- Speakers tab -->
+  <div class="tab-content" id="tab-speakers">
+    <div class="card">
+      <h2>Enrolled Speakers</h2>
+      <div id="speakers-list"><div class="empty">No speakers enrolled</div></div>
+      <div class="speaker-enroll-hint">
+        To enroll a new speaker, use the CLI: <code>deskvoice enroll &lt;name&gt;</code><br>
+        Or rename an existing speaker by clicking the edit button.
       </div>
     </div>
   </div>
 </div>
 
+<audio id="audio-el" preload="auto"></audio>
+
 <script>
 const state = {
   tokensIn: 0, tokensOut: 0, tokensTotal: 0,
-  chunks: 0, speechSecs: 0,
-  transcripts: [], tasks: [], tags: new Set(), decisions: [], questions: []
+  chunks: 0, speechSecs: 0, taskCount: 0,
+  transcripts: [], tasks: [], tags: new Set(), decisions: [], questions: [],
+  recState: 'recording', // recording, paused
+  recStartTime: null,
+  timerInterval: null,
+  // Player state
+  currentRecId: null,
+  isPlaying: false,
 };
 
 function $(id) { return document.getElementById(id); }
 
+// ---- Tabs ----
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelector('.tab-content#tab-' + name).classList.add('active');
+  event.target.classList.add('active');
+  if (name === 'recordings') loadRecordings();
+  if (name === 'speakers') loadSpeakers();
+}
+
+// ---- Recording controls ----
+function toggleRecording() {
+  if (state.recState === 'recording') {
+    fetch('/api/recording/pause', { method: 'POST' }).then(r => r.json()).then(d => {
+      if (d.ok) setRecState('paused');
+    });
+  } else {
+    fetch('/api/recording/resume', { method: 'POST' }).then(r => r.json()).then(d => {
+      if (d.ok) setRecState('recording');
+    });
+  }
+}
+
+function setRecState(s) {
+  state.recState = s;
+  const btn = $('rec-btn');
+  const timer = $('rec-timer');
+  const label = $('rec-label');
+  btn.className = 'rec-btn ' + s;
+  timer.className = 'rec-timer ' + (s === 'recording' ? 'active' : s);
+  label.textContent = s === 'recording' ? 'Recording' : 'Paused';
+  if (s === 'recording') {
+    state.recStartTime = Date.now();
+    startTimer();
+  } else {
+    stopTimer();
+  }
+}
+
+function startTimer() {
+  if (state.timerInterval) clearInterval(state.timerInterval);
+  state.timerInterval = setInterval(updateTimer, 1000);
+  updateTimer();
+}
+
+function stopTimer() {
+  // Keep timer display frozen at current value
+}
+
+function updateTimer() {
+  if (!state.recStartTime || state.recState !== 'recording') return;
+  const elapsed = Math.floor((Date.now() - state.recStartTime) / 1000);
+  const hrs = Math.floor(elapsed / 3600);
+  const mins = Math.floor((elapsed % 3600) / 60);
+  const secs = elapsed % 60;
+  const timer = $('rec-timer');
+  if (hrs > 0) {
+    timer.textContent = hrs + ':' + String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+  } else {
+    timer.textContent = String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+  }
+}
+
+// Init recording state
+fetch('/api/recording/state').then(r => r.json()).then(d => {
+  if (d.state) {
+    setRecState(d.state);
+    if (d.start_time && d.state === 'recording') {
+      state.recStartTime = new Date(d.start_time).getTime();
+      startTimer();
+    }
+  }
+});
+
+// ---- Token stats ----
 function updateTokens() {
   $('tokens-in').textContent = state.tokensIn.toLocaleString();
   $('tokens-out').textContent = state.tokensOut.toLocaleString();
@@ -267,10 +516,10 @@ function updateTokens() {
   $('speech-secs').textContent = Math.round(state.speechSecs) + 's';
 }
 
+// ---- Transcript ----
 function addTranscript(data) {
   const feed = $('transcript-feed');
   if (feed.querySelector('.empty')) feed.innerHTML = '';
-
   const entry = document.createElement('div');
   entry.className = 'transcript-entry';
   const time = new Date(data.timestamp).toLocaleTimeString();
@@ -281,9 +530,12 @@ function addTranscript(data) {
   feed.scrollTop = feed.scrollHeight;
 }
 
+// ---- Tasks ----
 function addTask(task) {
   const list = $('tasks-list');
   if (list.querySelector('.empty')) list.innerHTML = '';
+  state.taskCount++;
+  $('tasks-count').textContent = '(' + state.taskCount + ')';
 
   const item = document.createElement('div');
   item.className = 'task-item';
@@ -307,9 +559,11 @@ function addDecisionOrQuestion(type, text) {
   feed.appendChild(el);
 }
 
+// ---- Tags ----
 function addTag(tag) {
   if (state.tags.has(tag)) return;
   state.tags.add(tag);
+  $('tags-count').textContent = '(' + state.tags.size + ')';
   const list = $('tags-list');
   if (list.querySelector('.empty')) list.innerHTML = '';
   const el = document.createElement('span');
@@ -318,6 +572,7 @@ function addTag(tag) {
   list.appendChild(el);
 }
 
+// ---- Streaming ----
 function handleStreamToken(token) {
   const feed = $('transcript-feed');
   if (feed.querySelector('.empty')) feed.innerHTML = '';
@@ -355,7 +610,172 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
-// Load existing data
+// ---- Recordings ----
+function loadRecordings() {
+  fetch('/api/recordings').then(r => r.json()).then(recs => {
+    const list = $('recordings-list');
+    list.innerHTML = '';
+    if (!recs || recs.length === 0) {
+      list.innerHTML = '<div class="empty">No recordings yet</div>';
+      $('rec-count').textContent = '';
+      return;
+    }
+    $('rec-count').textContent = '(' + recs.length + ')';
+    recs.forEach(rec => {
+      const item = document.createElement('div');
+      item.className = 'recording-item';
+      const time = new Date(rec.created_at).toLocaleString();
+      const dur = formatDuration(rec.duration_seconds);
+      const transcript = rec.transcript ? rec.transcript.substring(0, 120) : 'No transcript';
+      const isPlaying = state.currentRecId === rec.id && state.isPlaying;
+      item.innerHTML = '<button class="rec-play-btn' + (isPlaying ? ' playing' : '') + '" onclick="playRecording(' + rec.id + ')" title="Play">'
+        + (isPlaying ? '&#9632;' : '&#9654;') + '</button>'
+        + '<div class="rec-info">'
+        + '<div class="rec-time">' + time + '</div>'
+        + '<div class="rec-transcript">' + escHtml(transcript) + '</div>'
+        + (rec.summary ? '<div class="rec-summary">' + escHtml(rec.summary) + '</div>' : '')
+        + '</div>'
+        + '<span class="rec-duration">' + dur + '</span>';
+      list.appendChild(item);
+    });
+  });
+}
+
+function formatDuration(secs) {
+  if (!secs) return '0s';
+  const m = Math.floor(secs / 60);
+  const s = Math.round(secs % 60);
+  return m > 0 ? m + 'm ' + s + 's' : s + 's';
+}
+
+function playRecording(recId) {
+  const audio = $('audio-el');
+  const bar = $('audio-player-bar');
+
+  if (state.currentRecId === recId && state.isPlaying) {
+    audio.pause();
+    state.isPlaying = false;
+    updatePlayerUI();
+    return;
+  }
+
+  state.currentRecId = recId;
+  audio.src = '/api/recordings/' + recId + '/audio';
+  audio.play();
+  state.isPlaying = true;
+  bar.classList.add('visible');
+  $('player-info').textContent = 'Recording #' + recId;
+  updatePlayerUI();
+}
+
+function togglePlayer() {
+  const audio = $('audio-el');
+  if (state.isPlaying) {
+    audio.pause();
+    state.isPlaying = false;
+  } else {
+    audio.play();
+    state.isPlaying = true;
+  }
+  updatePlayerUI();
+}
+
+function updatePlayerUI() {
+  const btn = $('player-play-btn');
+  btn.innerHTML = state.isPlaying ? '&#9646;&#9646;' : '&#9654;';
+  // Update recording list play buttons too
+  document.querySelectorAll('.rec-play-btn').forEach(b => {
+    b.classList.remove('playing');
+    b.innerHTML = '&#9654;';
+  });
+  if (state.isPlaying && state.currentRecId) {
+    // Highlight the playing recording button
+    loadRecordings();
+  }
+}
+
+function seekPlayer(e) {
+  const audio = $('audio-el');
+  if (!audio.duration) return;
+  const rect = $('player-progress').getBoundingClientRect();
+  const pct = (e.clientX - rect.left) / rect.width;
+  audio.currentTime = pct * audio.duration;
+}
+
+function closePlayer() {
+  const audio = $('audio-el');
+  audio.pause();
+  audio.src = '';
+  state.isPlaying = false;
+  state.currentRecId = null;
+  $('audio-player-bar').classList.remove('visible');
+}
+
+// Audio element events
+const audioEl = $('audio-el');
+audioEl.addEventListener('timeupdate', function() {
+  const cur = audioEl.currentTime;
+  const dur = audioEl.duration || 0;
+  $('player-current-time').textContent = formatTime(cur);
+  $('player-total-time').textContent = formatTime(dur);
+  const pct = dur > 0 ? (cur / dur) * 100 : 0;
+  $('player-progress-fill').style.width = pct + '%';
+});
+audioEl.addEventListener('ended', function() {
+  state.isPlaying = false;
+  updatePlayerUI();
+});
+
+function formatTime(secs) {
+  if (!secs || isNaN(secs)) return '0:00';
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+// ---- Speakers ----
+function loadSpeakers() {
+  fetch('/api/speakers').then(r => r.json()).then(speakers => {
+    const list = $('speakers-list');
+    list.innerHTML = '';
+    if (!speakers || speakers.length === 0) {
+      list.innerHTML = '<div class="empty">No speakers enrolled</div>';
+      return;
+    }
+    speakers.forEach(sp => {
+      const item = document.createElement('div');
+      item.className = 'speaker-item';
+      const initials = sp.name.split(' ').map(w => w[0]).join('').toUpperCase().substring(0, 2);
+      item.innerHTML = '<div class="speaker-avatar">' + escHtml(initials) + '</div>'
+        + '<div class="speaker-info">'
+        + '<div class="speaker-name" id="speaker-name-' + sp.id + '">' + escHtml(sp.name) + '</div>'
+        + '<div class="speaker-date">Enrolled: ' + new Date(sp.created_at).toLocaleDateString() + '</div>'
+        + '</div>'
+        + '<div class="speaker-actions">'
+        + '<button onclick="renameSpeaker(' + sp.id + ')">Rename</button>'
+        + '</div>';
+      list.appendChild(item);
+    });
+  });
+}
+
+function renameSpeaker(id) {
+  const nameEl = document.getElementById('speaker-name-' + id);
+  if (!nameEl) return;
+  const current = nameEl.textContent;
+  const newName = prompt('Rename speaker:', current);
+  if (newName && newName !== current) {
+    fetch('/api/speakers/' + id, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newName }),
+    }).then(r => r.json()).then(() => {
+      nameEl.textContent = newName;
+    });
+  }
+}
+
+// ---- Load initial data ----
 fetch('/api/tasks').then(r => r.json()).then(tasks => {
   tasks.forEach(t => addTask(t));
 });
@@ -373,7 +793,7 @@ fetch('/api/stats').then(r => r.json()).then(s => {
   }
 });
 
-// SSE connection
+// ---- SSE connection ----
 function connectSSE() {
   const es = new EventSource('/api/events');
   es.onmessage = function(e) {
@@ -406,8 +826,11 @@ function connectSSE() {
         handleStreamComplete();
         break;
       case 'task_completed':
-        const el = document.getElementById('task-' + d.task_id);
+        var el = document.getElementById('task-' + d.task_id);
         if (el) el.style.opacity = '0.4';
+        break;
+      case 'recording_state':
+        setRecState(d.state);
         break;
     }
   };
