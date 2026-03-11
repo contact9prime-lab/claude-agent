@@ -24,7 +24,7 @@ class AudioConfig:
     vad_threshold: float = 0.5  # Silero VAD confidence threshold
     speech_pad_ms: int = 300  # Padding around speech segments
     min_speech_duration_ms: int = 500  # Ignore speech shorter than this
-    min_silence_duration_ms: int = 1500  # Split on silence longer than this
+    min_silence_duration_ms: int = 7000  # Split on silence longer than this (5-10s gap)
 
     # Buffering — accumulate speech before sending to Gemini
     max_chunk_seconds: int = 120  # Send to Gemini every 2 min of speech max
