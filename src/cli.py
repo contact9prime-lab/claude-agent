@@ -1,0 +1,278 @@
+"""CLI interface for DeskVoice agent.
+
+Usage:
+    deskvoice listen          Start listening (main agent loop)
+    deskvoice devices         List available audio input devices
+    deskvoice tasks           Show pending tasks
+    deskvoice sessions        Show recent sessions
+    deskvoice search <query>  Search transcripts
+    deskvoice tags            Show all hashtags
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import sys
+
+import click
+from rich.console import Console
+from rich.table import Table
+
+from src.agent import DeskVoiceAgent
+from src.capture.audio_stream import find_blackhole_device, list_audio_devices
+from src.config import AgentConfig
+from src.storage.database import Database
+
+console = Console()
+
+
+@click.group()
+@click.option("--debug", is_flag=True, help="Enable debug logging")
+def cli(debug: bool) -> None:
+    """DeskVoice — always-on meeting & call transcript agent."""
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+@cli.command()
+@click.option("--device", type=int, default=None, help="Audio device index (use 'devices' to list)")
+@click.option("--mic", is_flag=True, help="Use default microphone instead of system audio")
+def listen(device: int | None, mic: bool) -> None:
+    """Start listening and recording transcripts."""
+    config = AgentConfig()
+
+    errors = config.validate()
+    if errors:
+        for e in errors:
+            console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    # Device selection
+    if device is None and not mic:
+        bh = find_blackhole_device()
+        if bh is not None:
+            console.print(f"[green]Found BlackHole device (index {bh}) for system audio capture[/green]")
+            device = bh
+        else:
+            console.print(
+                "[yellow]BlackHole not found. Using default microphone.[/yellow]\n"
+                "For system audio capture, install BlackHole: "
+                "https://github.com/ExistentialAudio/BlackHole"
+            )
+
+    agent = DeskVoiceAgent(config, device=device)
+
+    # Handle graceful shutdown
+    def _signal_handler(sig, frame):
+        console.print("\n[yellow]Shutting down...[/yellow]")
+        agent.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    console.print("[bold green]DeskVoice listening...[/bold green] Press Ctrl+C to stop.")
+    console.print(f"  Model: {config.gemini.model}")
+    console.print(f"  Database: {config.storage.db_path}")
+    console.print()
+
+    agent.start()
+
+
+@cli.command()
+def devices() -> None:
+    """List available audio input devices."""
+    devs = list_audio_devices()
+    bh = find_blackhole_device()
+
+    table = Table(title="Audio Input Devices")
+    table.add_column("Index", style="cyan")
+    table.add_column("Name")
+    table.add_column("Channels", justify="right")
+    table.add_column("Sample Rate", justify="right")
+    table.add_column("Note", style="green")
+
+    for dev in devs:
+        note = ""
+        if dev["index"] == bh:
+            note = "← System audio (BlackHole)"
+        table.add_row(
+            str(dev["index"]),
+            dev["name"],
+            str(dev["max_input_channels"]),
+            f"{dev['default_samplerate']:.0f}",
+            note,
+        )
+
+    console.print(table)
+    if bh is None:
+        console.print(
+            "\n[yellow]Tip:[/yellow] Install BlackHole for system audio capture: "
+            "https://github.com/ExistentialAudio/BlackHole"
+        )
+
+
+@cli.command()
+@click.option("--all", "show_all", is_flag=True, help="Show completed tasks too")
+def tasks(show_all: bool) -> None:
+    """Show extracted tasks."""
+    config = AgentConfig()
+    db = Database(config.storage.db_path)
+    db.connect()
+
+    task_list = db.list_tasks(pending_only=not show_all)
+
+    if not task_list:
+        console.print("[dim]No tasks found.[/dim]")
+        return
+
+    table = Table(title="Tasks")
+    table.add_column("ID", style="cyan", width=5)
+    table.add_column("Task")
+    table.add_column("Assignee", style="yellow")
+    table.add_column("Priority", style="magenta")
+    table.add_column("Due", style="green")
+    table.add_column("Session")
+    table.add_column("Done", justify="center")
+
+    for t in task_list:
+        done = "✓" if t["completed"] else ""
+        table.add_row(
+            str(t["id"]),
+            t["description"],
+            t["assignee"] or "-",
+            t["priority"],
+            t["due_hint"] or "-",
+            t.get("session_title") or f"#{t['session_id']}",
+            done,
+        )
+
+    console.print(table)
+    db.close()
+
+
+@cli.command()
+@click.option("--limit", default=10, help="Number of sessions to show")
+def sessions(limit: int) -> None:
+    """Show recent conversation sessions."""
+    config = AgentConfig()
+    db = Database(config.storage.db_path)
+    db.connect()
+
+    session_list = db.list_sessions(limit=limit)
+
+    if not session_list:
+        console.print("[dim]No sessions found.[/dim]")
+        return
+
+    table = Table(title="Recent Sessions")
+    table.add_column("ID", style="cyan", width=5)
+    table.add_column("Started")
+    table.add_column("Duration", justify="right")
+    table.add_column("Status", style="green")
+    table.add_column("Title / Summary")
+
+    for s in session_list:
+        duration = f"{s['total_speech_seconds']:.0f}s"
+        title = s["title"] or s["summary"][:60] if s["summary"] else "[dim]untitled[/dim]"
+        table.add_row(
+            str(s["id"]),
+            s["started_at"][:19],
+            duration,
+            s["status"],
+            title,
+        )
+
+    console.print(table)
+    db.close()
+
+
+@cli.command()
+@click.argument("query")
+def search(query: str) -> None:
+    """Search across all transcripts."""
+    config = AgentConfig()
+    db = Database(config.storage.db_path)
+    db.connect()
+
+    results = db.search_transcripts(query)
+
+    if not results:
+        console.print(f"[dim]No results for '{query}'[/dim]")
+        return
+
+    for s in results:
+        console.print(f"\n[bold cyan]Session #{s['id']}[/bold cyan] — {s['started_at'][:19]}")
+        if s["summary"]:
+            console.print(f"  [green]{s['summary']}[/green]")
+        # Show snippet of transcript with match
+        transcript = s.get("transcript", "")
+        if transcript:
+            lower_t = transcript.lower()
+            idx = lower_t.find(query.lower())
+            if idx >= 0:
+                start = max(0, idx - 50)
+                end = min(len(transcript), idx + len(query) + 50)
+                snippet = transcript[start:end].replace("\n", " ")
+                console.print(f"  ...{snippet}...")
+
+    db.close()
+
+
+@cli.command()
+def tags() -> None:
+    """Show all extracted hashtags."""
+    config = AgentConfig()
+    db = Database(config.storage.db_path)
+    db.connect()
+
+    hashtag_list = db.list_hashtags()
+
+    if not hashtag_list:
+        console.print("[dim]No hashtags found yet.[/dim]")
+        return
+
+    # Group by tag
+    by_tag: dict[str, list] = {}
+    for h in hashtag_list:
+        by_tag.setdefault(h["tag"], []).append(h)
+
+    table = Table(title="Hashtags")
+    table.add_column("Tag", style="cyan")
+    table.add_column("Count", justify="right", style="yellow")
+    table.add_column("Latest Context")
+
+    for tag, entries in sorted(by_tag.items(), key=lambda x: -len(x[1])):
+        table.add_row(
+            f"#{tag}",
+            str(len(entries)),
+            entries[0]["context"][:60] if entries[0]["context"] else "-",
+        )
+
+    console.print(table)
+    db.close()
+
+
+@cli.command()
+@click.argument("task_id", type=int)
+def done(task_id: int) -> None:
+    """Mark a task as completed."""
+    config = AgentConfig()
+    db = Database(config.storage.db_path)
+    db.connect()
+    db.complete_task(task_id)
+    console.print(f"[green]Task #{task_id} marked as done.[/green]")
+    db.close()
+
+
+def main() -> None:
+    cli()
+
+
+if __name__ == "__main__":
+    main()
