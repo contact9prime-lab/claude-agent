@@ -605,7 +605,7 @@ class Database:
             self.add_hashtag(hashtag, session_id)
 
         logger.info(
-            "Saved insight for session %d: %d tasks, %d hashtags",
+            "Saved insight for session %s: %d tasks, %d hashtags",
             session_id,
             len(insight.tasks),
             len(insight.hashtags),

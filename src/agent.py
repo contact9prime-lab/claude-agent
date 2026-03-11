@@ -167,13 +167,15 @@ class DeskVoiceAgent:
         except Exception:
             pass
 
+        # Capture session ID before any state changes
+        session_id = self._current_session_id
+
         # Flush any remaining speech in the VAD buffer
+        # _process_chunk is synchronous — it waits for the LLM response
         remaining = self._vad.flush()
         if remaining:
             self._process_chunk(remaining)
 
-        # Now run voice print analysis on the current session's recordings
-        session_id = self._current_session_id
         result = {
             "session_id": session_id,
             "voice_prints_detected": 0,
@@ -181,11 +183,14 @@ class DeskVoiceAgent:
             "speakers_identified": [],
         }
 
-        if session_id:
-            vp_result = self._analyze_session_voice_prints(session_id)
-            result.update(vp_result)
+        # Run voice print analysis on recent recordings.
+        # We analyze ALL recent recordings (not just by session_id) because
+        # some recordings may have been saved without a session link.
+        vp_result = self._analyze_voice_prints_on_recent_recordings(session_id)
+        result.update(vp_result)
 
-            # End the session
+        # End the session after all processing is done
+        if session_id and self._current_session_id == session_id:
             self._end_session()
 
         # Pause recording
@@ -202,11 +207,14 @@ class DeskVoiceAgent:
         logger.info("Stop processing complete: %s", result)
         return result
 
-    def _analyze_session_voice_prints(self, session_id: int) -> dict:
-        """Analyze all recordings in a session for voice prints.
+    def _analyze_voice_prints_on_recent_recordings(self, session_id: int = None) -> dict:
+        """Analyze recent recordings for voice prints.
 
         Segments audio, extracts embeddings, matches/creates voice prints,
         and stores speaker-attributed segments.
+
+        Uses session_id to filter if available, otherwise analyzes
+        the most recent recordings.
         """
         result = {
             "voice_prints_detected": 0,
@@ -225,91 +233,119 @@ class DeskVoiceAgent:
             logger.warning("Speaker ID not available — skipping voice print analysis")
             return result
 
-        # Get all recordings for this session
+        # Get recent recordings — try session filter first, fall back to recent
         recordings = self._db.list_recordings(limit=100)
-        session_recordings = [r for r in recordings if r.get("session_id") == session_id]
+        if session_id:
+            target_recordings = [r for r in recordings if r.get("session_id") == session_id]
+        else:
+            target_recordings = []
 
-        if not session_recordings:
+        # If no session-linked recordings found, use the most recent ones
+        # (recordings may have been saved with session_id=None due to timing)
+        if not target_recordings:
+            target_recordings = recordings[:20]  # Last 20 recordings
+            logger.info("No session-linked recordings found, analyzing %d recent recordings", len(target_recordings))
+
+        if not target_recordings:
+            logger.info("No recordings found for voice print analysis")
             return result
 
+        logger.info("Analyzing %d recordings for voice prints...", len(target_recordings))
         existing_prints = self._db.get_voice_print_embeddings()
         seen_speakers = set()
 
-        for rec in session_recordings:
-            audio_path = self.config.storage.audio_dir / rec["filename"]
-            if not audio_path.exists():
-                continue
+        import pickle
 
-            audio_data = audio_path.read_bytes()
-
-            # Segment the audio by speaker
-            segments = segment_audio_by_speaker(audio_data)
-            if not segments:
-                continue
-
-            # Group segments by cluster
-            clusters = {}
-            for seg in segments:
-                cid = seg["cluster"]
-                if cid not in clusters:
-                    clusters[cid] = []
-                clusters[cid].append(seg)
-
-            for cluster_id, cluster_segments in clusters.items():
-                # Average the embeddings for this cluster
-                avg_embedding = np.mean(
-                    [s["embedding"] for s in cluster_segments], axis=0
-                )
-
-                # Try to match against existing voice prints
-                match = match_voice_print(avg_embedding, existing_prints)
-
-                if match:
-                    vp_id, vp_label, score = match
-                    # Update the existing voice print with new data
-                    for existing in existing_prints:
-                        if existing[0] == vp_id:
-                            new_count = existing[3] + 1
-                            new_emb = update_averaged_embedding(
-                                existing[2], avg_embedding, existing[3]
-                            )
-                            self._db.update_voice_print_embedding(vp_id, new_emb, new_count)
-                            break
-                else:
-                    # Create a new voice print
-                    import pickle
-                    vp_label = f"Voice {len(existing_prints) + 1}"
-                    emb_bytes = pickle.dumps(avg_embedding)
-                    vp_id = self._db.add_voice_print(vp_label, emb_bytes)
-                    # Add to our local list so subsequent clusters can match
-                    existing_prints.append((vp_id, vp_label, emb_bytes, 1))
-                    result["voice_prints_detected"] += 1
-
-                seen_speakers.add((vp_id, vp_label))
-
-                # Store segments in database
-                for seg in cluster_segments:
-                    self._db.add_recording_segment(
-                        recording_id=rec["id"],
-                        voice_print_id=vp_id,
-                        speaker_label=vp_label,
-                        text="",  # Text is in the recording transcript
-                        start_seconds=seg["start"],
-                        end_seconds=seg["end"],
-                        confidence=0.0,
-                    )
-                    result["segments_processed"] += 1
-
-            # Broadcast progress
+        for rec in target_recordings:
             try:
-                from src.web.app import broadcast_event
-                broadcast_event("voice_print_progress", {
-                    "recording_id": rec["id"],
-                    "segments": len(segments),
-                    "clusters": len(clusters),
-                })
-            except Exception:
-                pass
+                audio_path = self.config.storage.audio_dir / rec["filename"]
+                if not audio_path.exists():
+                    logger.debug("Audio file not found: %s", audio_path)
+                    continue
+
+                audio_data = audio_path.read_bytes()
+                logger.info("Analyzing recording #%s (%s, %.1fs)...",
+                            rec.get("id"), rec["filename"], rec.get("duration_seconds", 0))
+
+                # Segment the audio by speaker
+                segments = segment_audio_by_speaker(audio_data)
+                if not segments:
+                    logger.info("No speaker segments found in recording #%s", rec.get("id"))
+                    continue
+
+                logger.info("Found %d speaker segments in recording #%s", len(segments), rec.get("id"))
+
+                # Group segments by cluster
+                clusters = {}
+                for seg in segments:
+                    cid = seg["cluster"]
+                    if cid not in clusters:
+                        clusters[cid] = []
+                    clusters[cid].append(seg)
+
+                logger.info("Detected %d unique speaker clusters in recording #%s", len(clusters), rec.get("id"))
+
+                for cluster_id, cluster_segments in clusters.items():
+                    # Average the embeddings for this cluster
+                    avg_embedding = np.mean(
+                        [s["embedding"] for s in cluster_segments], axis=0
+                    )
+
+                    # Try to match against existing voice prints
+                    match = match_voice_print(avg_embedding, existing_prints)
+
+                    if match:
+                        vp_id, vp_label, score = match
+                        logger.info("Matched cluster %d to voice print '%s' (id=%d, score=%.3f)",
+                                    cluster_id, vp_label, vp_id, score)
+                        # Update the existing voice print with new data
+                        for existing in existing_prints:
+                            if existing[0] == vp_id:
+                                new_count = existing[3] + 1
+                                new_emb = update_averaged_embedding(
+                                    existing[2], avg_embedding, existing[3]
+                                )
+                                self._db.update_voice_print_embedding(vp_id, new_emb, new_count)
+                                break
+                    else:
+                        # Create a new voice print
+                        vp_label = f"Voice {len(existing_prints) + 1}"
+                        emb_bytes = pickle.dumps(avg_embedding)
+                        vp_id = self._db.add_voice_print(vp_label, emb_bytes)
+                        # Add to our local list so subsequent clusters can match
+                        existing_prints.append((vp_id, vp_label, emb_bytes, 1))
+                        result["voice_prints_detected"] += 1
+                        logger.info("Created new voice print '%s' (id=%d) from cluster %d",
+                                    vp_label, vp_id, cluster_id)
+
+                    seen_speakers.add((vp_id, vp_label))
+
+                    # Store segments in database
+                    for seg in cluster_segments:
+                        self._db.add_recording_segment(
+                            recording_id=rec["id"],
+                            voice_print_id=vp_id,
+                            speaker_label=vp_label,
+                            text="",  # Text is in the recording transcript
+                            start_seconds=seg["start"],
+                            end_seconds=seg["end"],
+                            confidence=0.0,
+                        )
+                        result["segments_processed"] += 1
+
+                # Broadcast progress
+                try:
+                    from src.web.app import broadcast_event
+                    broadcast_event("voice_print_progress", {
+                        "recording_id": rec["id"],
+                        "segments": len(segments),
+                        "clusters": len(clusters),
+                    })
+                except Exception:
+                    pass
+
+            except Exception as e:
+                logger.error("Failed to analyze recording #%s: %s", rec.get("id"), e, exc_info=True)
 
         result["speakers_identified"] = [
             {"id": vp_id, "label": label} for vp_id, label in seen_speakers
