@@ -36,7 +36,7 @@ class GeminiConfig:
     """Gemini API settings."""
 
     api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
-    model: str = "gemini-2.5-flash"  # Cheapest, fastest
+    model: str = "gemini-3-flash"  # Cheapest, fastest
     max_audio_bytes: int = 20 * 1024 * 1024  # 20MB per request
     temperature: float = 0.1  # Low creativity for transcription
 
