@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -68,22 +69,80 @@ class LLMProvider(ABC):
     def transcribe_and_extract(self, chunk: AudioChunk) -> Insight:
         """Send audio to the LLM and get back structured insights."""
 
+    @staticmethod
+    def _try_recover_json(text: str) -> Optional[dict]:
+        """Try to recover truncated JSON by closing open structures."""
+        # Count open braces/brackets
+        opens = 0
+        open_brackets = 0
+        in_string = False
+        escape = False
+        for ch in text:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                opens += 1
+            elif ch == "}":
+                opens -= 1
+            elif ch == "[":
+                open_brackets += 1
+            elif ch == "]":
+                open_brackets -= 1
+
+        if opens <= 0 and open_brackets <= 0:
+            return None  # Not a truncation issue
+
+        # Truncate to last complete value, then close structures
+        # Find last complete key-value (ends with , or after a value)
+        # Simple approach: strip trailing incomplete string/value, close brackets
+        truncated = text.rstrip()
+        # Remove trailing incomplete string
+        if in_string:
+            last_quote = truncated.rfind('"')
+            if last_quote > 0:
+                truncated = truncated[:last_quote + 1]
+                in_string = False
+
+        # Remove trailing comma or colon
+        truncated = truncated.rstrip(",: \n\t")
+
+        # Close open structures
+        truncated += "]" * max(0, open_brackets) + "}" * max(0, opens)
+
+        try:
+            return json.loads(truncated)
+        except json.JSONDecodeError:
+            return None
+
     def _parse_response(self, text: str) -> Insight:
         """Parse JSON response into an Insight object."""
         cleaned = text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[-1]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3].strip()
+
+        # Strip markdown code fences (```json ... ``` or ``` ... ```)
+        fence_match = re.match(r"^```(?:json)?\s*\n(.*?)(?:\n```\s*)?$", cleaned, re.DOTALL)
+        if fence_match:
+            cleaned = fence_match.group(1).strip()
 
         try:
             data = json.loads(cleaned)
         except json.JSONDecodeError:
-            logger.error("Failed to parse LLM response as JSON: %s", text[:200])
-            return Insight(
-                transcript=text,
-                summary="[Failed to parse structured response]",
-            )
+            # Try to recover truncated JSON by closing open braces/brackets
+            data = self._try_recover_json(cleaned)
+            if data is None:
+                logger.error("Failed to parse LLM response as JSON: %s", text[:200])
+                return Insight(
+                    transcript=text,
+                    summary="[Failed to parse structured response]",
+                )
 
         segments = [
             TranscriptSegment(
@@ -160,7 +219,8 @@ class GeminiProvider(LLMProvider):
             ],
             config=types.GenerateContentConfig(
                 temperature=self.config.temperature,
-                max_output_tokens=4096,
+                max_output_tokens=8192,
+                response_mime_type="application/json",
             ),
         )
 

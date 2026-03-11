@@ -94,7 +94,6 @@ def create_app(config: AgentConfig) -> FastAPI:
     @app.get("/api/stats")
     def get_stats():
         """Get agent stats if available."""
-        from src.web import _agent_stats
         return _agent_stats.copy() if _agent_stats else {}
 
     # --- HTML frontend ---

@@ -231,9 +231,9 @@ class DeskVoiceAgent:
     def _broadcast_insight(self, insight, chunk: AudioChunk) -> None:
         """Send insight data to connected web UI clients."""
         try:
-            from src.web.app import broadcast_event
-            import src.web as web_mod
-            web_mod._agent_stats = self._stats.copy()
+            from src.web.app import broadcast_event, _agent_stats
+            _agent_stats.clear()
+            _agent_stats.update(self._stats)
             broadcast_event("insight", {
                 "transcript": insight.transcript,
                 "summary": insight.summary,
