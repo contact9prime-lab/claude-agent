@@ -1,7 +1,8 @@
 """FastAPI web UI for DeskVoice.
 
 Provides a dashboard showing live transcripts, tasks, sessions, and token usage.
-Uses Server-Sent Events (SSE) for real-time updates from the agent.
+Uses WebSocket for real-time bidirectional updates and SSE as fallback.
+Features voice print management and stop-recording processing flow.
 """
 
 from __future__ import annotations
@@ -9,11 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -22,17 +24,36 @@ from src.storage.database import Database
 
 logger = logging.getLogger(__name__)
 
-# Global event bus for SSE
+# Global event bus for SSE and WebSocket
 _event_queues: list[asyncio.Queue] = []
+_ws_clients: list[WebSocket] = []
 
 
 def broadcast_event(event_type: str, data: dict) -> None:
-    """Broadcast an event to all connected SSE clients."""
+    """Broadcast an event to all connected SSE and WebSocket clients."""
     msg = {"type": event_type, "data": data, "timestamp": datetime.now().isoformat()}
+
+    # SSE clients
     for q in _event_queues:
         try:
             q.put_nowait(msg)
         except asyncio.QueueFull:
+            pass
+
+    # WebSocket clients
+    msg_str = json.dumps(msg)
+    disconnected = []
+    for ws in _ws_clients:
+        try:
+            asyncio.get_event_loop().call_soon_threadsafe(
+                asyncio.ensure_future, ws.send_text(msg_str)
+            )
+        except Exception:
+            disconnected.append(ws)
+    for ws in disconnected:
+        try:
+            _ws_clients.remove(ws)
+        except ValueError:
             pass
 
 
@@ -43,7 +64,56 @@ def create_app(config: AgentConfig) -> FastAPI:
     db = Database(config.storage.db_path)
     db.connect()
 
-    # --- SSE endpoint ---
+    # --- WebSocket endpoint ---
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket):
+        await websocket.accept()
+        _ws_clients.append(websocket)
+        logger.info("WebSocket client connected (%d total)", len(_ws_clients))
+        try:
+            while True:
+                data = await websocket.receive_text()
+                msg = json.loads(data)
+                # Handle client messages
+                if msg.get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                elif msg.get("type") == "request_state":
+                    # Send current state to the new client
+                    state = _build_current_state(db)
+                    await websocket.send_text(json.dumps({
+                        "type": "state_sync",
+                        "data": state,
+                        "timestamp": datetime.now().isoformat(),
+                    }))
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.debug("WebSocket error: %s", e)
+        finally:
+            try:
+                _ws_clients.remove(websocket)
+            except ValueError:
+                pass
+            logger.info("WebSocket client disconnected (%d remaining)", len(_ws_clients))
+
+    def _build_current_state(db: Database) -> dict:
+        """Build the current state for a newly connected client."""
+        rec_state = "stopped"
+        start_time = None
+        if _agent_ref:
+            rec_state = "paused" if _agent_ref.is_paused else "recording"
+            start_time = _agent_ref.recording_start_time
+        return {
+            "recording_state": rec_state,
+            "recording_start_time": start_time.isoformat() if start_time else None,
+            "stats": _agent_stats.copy() if _agent_stats else {},
+            "tasks": db.list_tasks(pending_only=True),
+            "tags": db.list_hashtags(),
+            "voice_prints": db.list_voice_prints(),
+            "speakers": db.list_speakers(),
+        }
+
+    # --- SSE endpoint (fallback) ---
     @app.get("/api/events")
     async def events(request: Request):
         queue: asyncio.Queue = asyncio.Queue(maxsize=100)
@@ -93,7 +163,6 @@ def create_app(config: AgentConfig) -> FastAPI:
 
     @app.get("/api/stats")
     def get_stats():
-        """Get agent stats if available."""
         return _agent_stats.copy() if _agent_stats else {}
 
     # --- Speaker endpoints ---
@@ -107,8 +176,6 @@ def create_app(config: AgentConfig) -> FastAPI:
         name = body.get("name", "")
         if not name:
             return {"error": "name is required"}
-        # Enrollment via API requires pre-recorded audio
-        # For now return the speaker list
         return {"message": "Use CLI 'deskvoice enroll' for voice enrollment"}
 
     @app.put("/api/speakers/{speaker_id}")
@@ -134,10 +201,42 @@ def create_app(config: AgentConfig) -> FastAPI:
             return {"ok": True, "state": "recording"}
         return {"ok": False, "error": "Agent not available"}
 
+    @app.post("/api/recording/stop")
+    def stop_recording():
+        """Stop recording and process all buffered audio in the backend.
+
+        This triggers:
+        1. Flush VAD buffer and process remaining speech
+        2. Voice print analysis on the session's recordings
+        3. Speaker segmentation and tagging
+        """
+        if not _agent_ref:
+            return {"ok": False, "error": "Agent not available"}
+
+        # Run processing in a background thread to not block the API
+        result = {"ok": True, "state": "processing"}
+
+        def _process():
+            try:
+                proc_result = _agent_ref.stop_and_process()
+                broadcast_event("processing_complete", proc_result)
+            except Exception as e:
+                logger.error("Stop processing failed: %s", e)
+                broadcast_event("processing_error", {"error": str(e)})
+
+        thread = threading.Thread(target=_process, daemon=True)
+        thread.start()
+        return result
+
     @app.get("/api/recording/state")
     def recording_state():
         if _agent_ref:
-            state = "paused" if _agent_ref.is_paused else "recording"
+            if _agent_ref.is_paused:
+                state = "paused"
+            elif _agent_ref.is_recording:
+                state = "recording"
+            else:
+                state = "stopped"
             start_time = _agent_ref.recording_start_time
             return {
                 "state": state,
@@ -163,6 +262,63 @@ def create_app(config: AgentConfig) -> FastAPI:
         if not audio_path.exists():
             return {"error": "Audio file not found"}
         return FileResponse(audio_path, media_type="audio/wav", filename=rec["filename"])
+
+    @app.get("/api/recordings/{recording_id}/segments")
+    def get_recording_segments(recording_id: int):
+        """Get speaker-attributed segments for a recording."""
+        return db.get_recording_segments(recording_id)
+
+    # --- Voice Print endpoints ---
+    @app.get("/api/voice-prints")
+    def get_voice_prints():
+        """List all detected voice prints."""
+        return db.list_voice_prints()
+
+    @app.put("/api/voice-prints/{vp_id}")
+    async def update_voice_print(vp_id: int, request: Request):
+        """Rename a voice print label."""
+        body = await request.json()
+        label = body.get("label", "")
+        if label:
+            db.rename_voice_print(vp_id, label)
+            broadcast_event("voice_print_updated", {"id": vp_id, "label": label})
+        return {"ok": True}
+
+    @app.post("/api/voice-prints/{vp_id}/map")
+    async def map_voice_print(vp_id: int, request: Request):
+        """Map a voice print to a known speaker."""
+        body = await request.json()
+        speaker_id = body.get("speaker_id")
+        if speaker_id is None:
+            return {"error": "speaker_id is required"}
+        db.map_voice_print_to_speaker(vp_id, speaker_id)
+        broadcast_event("voice_print_mapped", {
+            "voice_print_id": vp_id,
+            "speaker_id": speaker_id,
+        })
+        return {"ok": True}
+
+    @app.post("/api/voice-prints/merge")
+    async def merge_voice_prints(request: Request):
+        """Merge two voice prints (e.g., same person detected twice)."""
+        body = await request.json()
+        keep_id = body.get("keep_id")
+        merge_id = body.get("merge_id")
+        if not keep_id or not merge_id:
+            return {"error": "keep_id and merge_id are required"}
+        db.merge_voice_prints(keep_id, merge_id)
+        broadcast_event("voice_prints_merged", {
+            "keep_id": keep_id,
+            "merge_id": merge_id,
+        })
+        return {"ok": True}
+
+    @app.delete("/api/voice-prints/{vp_id}")
+    def delete_voice_print(vp_id: int):
+        """Delete a voice print."""
+        db.delete_voice_print(vp_id)
+        broadcast_event("voice_print_deleted", {"id": vp_id})
+        return {"ok": True}
 
     # --- Task management endpoints ---
     @app.put("/api/tasks/{task_id}")
@@ -217,7 +373,7 @@ DASHBOARD_HTML = """\
     --bg: #0f0f0f; --surface: #1a1a2e; --surface2: #16213e;
     --accent: #0f3460; --text: #e0e0e0; --text-dim: #888;
     --green: #4ecca3; --yellow: #f0c929; --red: #e74c3c; --blue: #3498db;
-    --orange: #e67e22;
+    --orange: #e67e22; --purple: #9b59b6;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: 'SF Mono', 'Fira Code', monospace; background: var(--bg); color: var(--text); }
@@ -237,12 +393,20 @@ DASHBOARD_HTML = """\
   .rec-btn.recording .rec-icon { background: var(--red); }
   .rec-btn.paused { border-color: var(--yellow); }
   .rec-btn.paused .rec-icon { background: var(--yellow); border-radius: 2px; width: 14px; height: 14px; }
+  .rec-btn.stopped { border-color: var(--text-dim); }
+  .rec-btn.stopped .rec-icon { background: var(--green); }
+  .rec-btn.processing { border-color: var(--orange); animation: rec-pulse 1s infinite; }
+  .rec-btn.processing .rec-icon { background: var(--orange); border-radius: 2px; width: 14px; height: 14px; }
   .rec-icon { width: 16px; height: 16px; border-radius: 50%; background: var(--green); transition: all 0.2s; }
   @keyframes rec-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.4); } 50% { box-shadow: 0 0 0 8px rgba(231, 76, 60, 0); } }
   .rec-timer { font-size: 1.3em; font-weight: bold; font-variant-numeric: tabular-nums; min-width: 80px; color: var(--text); }
   .rec-timer.active { color: var(--red); }
   .rec-timer.paused { color: var(--yellow); }
+  .rec-timer.processing { color: var(--orange); }
   .rec-label { font-size: 0.75em; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }
+  .stop-btn { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--red); background: transparent; color: var(--red); cursor: pointer; font-family: inherit; font-size: 0.8em; font-weight: bold; transition: all 0.2s; }
+  .stop-btn:hover { background: var(--red); color: white; }
+  .stop-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
   /* Tabs */
   .tabs { display: flex; gap: 2px; margin-bottom: 16px; background: var(--surface); border-radius: 8px; padding: 3px; }
@@ -259,6 +423,7 @@ DASHBOARD_HTML = """\
   .card h2 .count { color: var(--text-dim); font-size: 0.9em; }
   .transcript-entry { padding: 8px 0; border-bottom: 1px solid #ffffff10; }
   .transcript-entry .time { color: var(--text-dim); font-size: 0.75em; }
+  .transcript-entry .speaker-tag { display: inline-block; background: var(--accent); color: var(--blue); padding: 1px 6px; border-radius: 4px; font-size: 0.75em; margin-left: 6px; }
   .transcript-entry .text { margin-top: 4px; line-height: 1.5; }
   .transcript-entry .summary { color: var(--blue); font-size: 0.85em; margin-top: 4px; font-style: italic; }
   .task-item { display: flex; align-items: flex-start; gap: 8px; padding: 8px 0; border-bottom: 1px solid #ffffff10; }
@@ -284,6 +449,10 @@ DASHBOARD_HTML = """\
   #tasks-list { max-height: 400px; overflow-y: auto; }
   .empty { color: var(--text-dim); font-style: italic; font-size: 0.85em; padding: 20px 0; text-align: center; }
 
+  /* Live streaming indicator */
+  .streaming-indicator { display: none; color: var(--orange); font-size: 0.75em; animation: pulse 1s infinite; margin-bottom: 4px; }
+  .streaming-indicator.active { display: block; }
+
   /* Recordings list */
   .recording-item { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #ffffff10; }
   .recording-item .rec-play-btn { width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--green); background: transparent; color: var(--green); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 0.2s; }
@@ -294,6 +463,7 @@ DASHBOARD_HTML = """\
   .recording-item .rec-info .rec-time { font-size: 0.75em; color: var(--text-dim); }
   .recording-item .rec-info .rec-transcript { font-size: 0.85em; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .recording-item .rec-info .rec-summary { font-size: 0.8em; color: var(--blue); font-style: italic; }
+  .recording-item .rec-info .rec-speakers { font-size: 0.75em; color: var(--purple); margin-top: 2px; }
   .recording-item .rec-duration { color: var(--text-dim); font-size: 0.8em; flex-shrink: 0; }
   #recordings-list { max-height: 500px; overflow-y: auto; }
 
@@ -309,6 +479,21 @@ DASHBOARD_HTML = """\
   .audio-player-bar .player-close { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 1.1em; padding: 4px; }
   .audio-player-bar .player-close:hover { color: var(--text); }
 
+  /* Voice prints section */
+  .vp-item { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #ffffff10; }
+  .vp-item .vp-avatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.8em; font-weight: bold; flex-shrink: 0; }
+  .vp-item .vp-info { flex: 1; }
+  .vp-item .vp-label { font-size: 0.9em; cursor: pointer; }
+  .vp-item .vp-label:hover { color: var(--green); }
+  .vp-item .vp-meta { font-size: 0.75em; color: var(--text-dim); }
+  .vp-item .vp-mapped { font-size: 0.75em; color: var(--green); }
+  .vp-item .vp-actions { display: flex; gap: 4px; }
+  .vp-item .vp-actions button { background: var(--accent); border: none; color: var(--text-dim); padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 0.75em; font-family: inherit; }
+  .vp-item .vp-actions button:hover { color: var(--text); background: var(--surface2); }
+  .vp-item .vp-actions .map-btn { color: var(--green); }
+  .vp-item .vp-actions .delete-btn { color: var(--red); }
+  #voice-prints-list { max-height: 400px; overflow-y: auto; }
+
   /* Speakers / voiceprint section */
   .speaker-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #ffffff10; }
   .speaker-item .speaker-avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: var(--blue); display: flex; align-items: center; justify-content: center; font-size: 0.85em; font-weight: bold; flex-shrink: 0; }
@@ -320,6 +505,14 @@ DASHBOARD_HTML = """\
   .speaker-item .speaker-actions button:hover { color: var(--text); background: var(--surface2); }
   #speakers-list { max-height: 300px; overflow-y: auto; }
   .speaker-enroll-hint { font-size: 0.8em; color: var(--text-dim); margin-top: 8px; padding: 8px; background: var(--surface2); border-radius: 6px; }
+
+  /* Processing overlay */
+  .processing-banner { display: none; background: var(--surface2); border: 1px solid var(--orange); border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; align-items: center; gap: 12px; }
+  .processing-banner.visible { display: flex; }
+  .processing-banner .spinner { width: 20px; height: 20px; border: 2px solid var(--orange); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .processing-banner .processing-text { flex: 1; color: var(--orange); font-size: 0.9em; }
+  .processing-banner .processing-detail { font-size: 0.75em; color: var(--text-dim); }
 </style>
 </head>
 <body>
@@ -333,6 +526,7 @@ DASHBOARD_HTML = """\
           <div class="rec-icon"></div>
         </button>
         <div class="rec-timer active" id="rec-timer">00:00</div>
+        <button class="stop-btn" id="stop-btn" onclick="stopRecording()" title="Stop and process">STOP</button>
       </div>
       <div class="status">
         <span id="connection" class="live">&#9679; Connected</span>
@@ -340,7 +534,16 @@ DASHBOARD_HTML = """\
     </div>
   </header>
 
-  <!-- Audio player bar (shown when playing a recording) -->
+  <!-- Processing banner -->
+  <div class="processing-banner" id="processing-banner">
+    <div class="spinner"></div>
+    <div>
+      <div class="processing-text">Processing recording...</div>
+      <div class="processing-detail" id="processing-detail">Analyzing voice prints and transcripts</div>
+    </div>
+  </div>
+
+  <!-- Audio player bar -->
   <div class="audio-player-bar" id="audio-player-bar">
     <button class="player-btn" id="player-play-btn" onclick="togglePlayer()">&#9654;</button>
     <span class="player-info" id="player-info">-</span>
@@ -356,6 +559,7 @@ DASHBOARD_HTML = """\
   <div class="tabs">
     <button class="tab active" onclick="switchTab('dashboard')">Dashboard</button>
     <button class="tab" onclick="switchTab('recordings')">Recordings</button>
+    <button class="tab" onclick="switchTab('voiceprints')">Voice Prints</button>
     <button class="tab" onclick="switchTab('speakers')">Speakers</button>
   </div>
 
@@ -375,6 +579,7 @@ DASHBOARD_HTML = """\
       <div>
         <div class="card">
           <h2>Live Transcript</h2>
+          <div class="streaming-indicator" id="streaming-indicator">Transcribing...</div>
           <div id="transcript-feed"><div class="empty">Waiting for speech...</div></div>
         </div>
         <div class="card">
@@ -403,6 +608,14 @@ DASHBOARD_HTML = """\
     </div>
   </div>
 
+  <!-- Voice Prints tab -->
+  <div class="tab-content" id="tab-voiceprints">
+    <div class="card">
+      <h2>Detected Voice Prints <span class="count" id="vp-count"></span></h2>
+      <div id="voice-prints-list"><div class="empty">No voice prints detected yet. Record audio and stop to analyze.</div></div>
+    </div>
+  </div>
+
   <!-- Speakers tab -->
   <div class="tab-content" id="tab-speakers">
     <div class="card">
@@ -410,7 +623,7 @@ DASHBOARD_HTML = """\
       <div id="speakers-list"><div class="empty">No speakers enrolled</div></div>
       <div class="speaker-enroll-hint">
         To enroll a new speaker, use the CLI: <code>deskvoice enroll &lt;name&gt;</code><br>
-        Or rename an existing speaker by clicking the edit button.
+        Or map a detected voice print to a speaker name in the Voice Prints tab.
       </div>
     </div>
   </div>
@@ -423,50 +636,224 @@ const state = {
   tokensIn: 0, tokensOut: 0, tokensTotal: 0,
   chunks: 0, speechSecs: 0, taskCount: 0,
   transcripts: [], tasks: [], tags: new Set(), decisions: [], questions: [],
-  recState: 'recording', // recording, paused
+  recState: 'recording',
   recStartTime: null,
   timerInterval: null,
-  // Player state
   currentRecId: null,
   isPlaying: false,
+  ws: null,
+  wsReconnectDelay: 1000,
+  voicePrints: [],
+  speakers: [],
 };
 
 function $(id) { return document.getElementById(id); }
 
+// ---- WebSocket Connection ----
+function connectWS() {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(protocol + '//' + location.host + '/ws');
+
+  ws.onopen = function() {
+    state.ws = ws;
+    state.wsReconnectDelay = 1000;
+    $('connection').textContent = '\\u25cf Connected (WS)';
+    $('connection').style.color = 'var(--green)';
+    $('connection').className = 'live';
+    // Request initial state
+    ws.send(JSON.stringify({type: 'request_state'}));
+  };
+
+  ws.onmessage = function(e) {
+    const msg = JSON.parse(e.data);
+    handleEvent(msg);
+  };
+
+  ws.onclose = function() {
+    state.ws = null;
+    $('connection').textContent = '\\u25cf Reconnecting...';
+    $('connection').style.color = 'var(--red)';
+    $('connection').className = '';
+    setTimeout(connectWS, state.wsReconnectDelay);
+    state.wsReconnectDelay = Math.min(state.wsReconnectDelay * 2, 10000);
+  };
+
+  ws.onerror = function() {
+    ws.close();
+  };
+}
+
+function handleEvent(msg) {
+  const d = msg.data;
+  switch (msg.type) {
+    case 'state_sync':
+      // Full state sync for new connection
+      if (d.recording_state) setRecState(d.recording_state);
+      if (d.recording_start_time && d.recording_state === 'recording') {
+        state.recStartTime = new Date(d.recording_start_time).getTime();
+        startTimer();
+      }
+      if (d.stats && d.stats.total_input_tokens) {
+        state.tokensIn = d.stats.total_input_tokens;
+        state.tokensOut = d.stats.total_output_tokens;
+        state.tokensTotal = d.stats.total_tokens;
+        state.chunks = d.stats.chunks_processed || 0;
+        state.speechSecs = d.stats.speech_seconds || 0;
+        updateTokens();
+      }
+      (d.tasks || []).forEach(function(t) { addTask(t); });
+      (d.tags || []).forEach(function(t) { addTag(t.tag); });
+      if (d.voice_prints) { state.voicePrints = d.voice_prints; }
+      if (d.speakers) { state.speakers = d.speakers; }
+      break;
+
+    case 'insight':
+      if (d.transcript) {
+        // Find speaker labels in segments
+        var speakers = [];
+        if (d.segments) {
+          d.segments.forEach(function(seg) { if (seg.speaker) speakers.push(seg.speaker); });
+        }
+        addTranscript({
+          transcript: d.transcript,
+          summary: d.summary,
+          timestamp: msg.timestamp,
+          speakers: [...new Set(speakers)],
+        });
+      }
+      (d.tasks || []).forEach(function(t) { addTask(t); });
+      (d.decisions || []).forEach(function(dec) { addDecisionOrQuestion('decision', dec); });
+      (d.questions || []).forEach(function(q) { addDecisionOrQuestion('question', q); });
+      (d.hashtags || []).forEach(function(h) { addTag(h.tag || h); });
+      if (d.token_usage) {
+        state.tokensIn += d.token_usage.input_tokens || 0;
+        state.tokensOut += d.token_usage.output_tokens || 0;
+        state.tokensTotal += d.token_usage.total_tokens || 0;
+      }
+      state.chunks++;
+      state.speechSecs += d.duration_seconds || 0;
+      updateTokens();
+      break;
+
+    case 'stream_token':
+      handleStreamToken(d.token || '');
+      break;
+
+    case 'stream_complete':
+      handleStreamComplete();
+      break;
+
+    case 'session_started':
+      break;
+
+    case 'session_ended':
+      break;
+
+    case 'task_completed':
+      var el = document.getElementById('task-' + d.task_id);
+      if (el) el.style.opacity = '0.4';
+      break;
+
+    case 'recording_state':
+      setRecState(d.state);
+      break;
+
+    case 'processing_complete':
+      setRecState('stopped');
+      $('processing-banner').classList.remove('visible');
+      if (d.voice_prints_detected > 0 || d.segments_processed > 0) {
+        loadVoicePrints();
+      }
+      break;
+
+    case 'processing_error':
+      setRecState('stopped');
+      $('processing-banner').classList.remove('visible');
+      break;
+
+    case 'voice_print_progress':
+      $('processing-detail').textContent = 'Analyzed recording: ' + d.segments + ' segments, ' + d.clusters + ' speakers detected';
+      break;
+
+    case 'voice_print_updated':
+    case 'voice_print_mapped':
+    case 'voice_prints_merged':
+    case 'voice_print_deleted':
+      loadVoicePrints();
+      break;
+
+    case 'reminder':
+      break;
+
+    case 'pong':
+      break;
+  }
+}
+
 // ---- Tabs ----
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+  document.querySelectorAll('.tab-content').forEach(function(t) { t.classList.remove('active'); });
   document.querySelector('.tab-content#tab-' + name).classList.add('active');
   event.target.classList.add('active');
   if (name === 'recordings') loadRecordings();
+  if (name === 'voiceprints') loadVoicePrints();
   if (name === 'speakers') loadSpeakers();
 }
 
 // ---- Recording controls ----
 function toggleRecording() {
   if (state.recState === 'recording') {
-    fetch('/api/recording/pause', { method: 'POST' }).then(r => r.json()).then(d => {
+    fetch('/api/recording/pause', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
       if (d.ok) setRecState('paused');
     });
-  } else {
-    fetch('/api/recording/resume', { method: 'POST' }).then(r => r.json()).then(d => {
+  } else if (state.recState === 'paused' || state.recState === 'stopped') {
+    fetch('/api/recording/resume', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
       if (d.ok) setRecState('recording');
     });
   }
 }
 
+function stopRecording() {
+  if (state.recState === 'processing') return;
+  setRecState('processing');
+  $('processing-banner').classList.add('visible');
+  $('processing-detail').textContent = 'Analyzing voice prints and transcripts...';
+  $('stop-btn').disabled = true;
+
+  fetch('/api/recording/stop', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
+    if (!d.ok) {
+      setRecState('stopped');
+      $('processing-banner').classList.remove('visible');
+    }
+    // Results will come via WebSocket/SSE 'processing_complete' event
+  }).catch(function() {
+    setRecState('stopped');
+    $('processing-banner').classList.remove('visible');
+  });
+}
+
 function setRecState(s) {
   state.recState = s;
-  const btn = $('rec-btn');
-  const timer = $('rec-timer');
-  const label = $('rec-label');
+  var btn = $('rec-btn');
+  var timer = $('rec-timer');
+  var label = $('rec-label');
+  var stopBtn = $('stop-btn');
   btn.className = 'rec-btn ' + s;
   timer.className = 'rec-timer ' + (s === 'recording' ? 'active' : s);
-  label.textContent = s === 'recording' ? 'Recording' : 'Paused';
+
+  var labels = {recording: 'Recording', paused: 'Paused', stopped: 'Stopped', processing: 'Processing...'};
+  label.textContent = labels[s] || s;
+  stopBtn.disabled = (s === 'processing' || s === 'stopped');
+
   if (s === 'recording') {
-    state.recStartTime = Date.now();
+    state.recStartTime = state.recStartTime || Date.now();
     startTimer();
+  } else if (s === 'stopped') {
+    stopTimer();
+    timer.textContent = '00:00';
+    state.recStartTime = null;
+    stopBtn.disabled = true;
   } else {
     stopTimer();
   }
@@ -484,28 +871,17 @@ function stopTimer() {
 
 function updateTimer() {
   if (!state.recStartTime || state.recState !== 'recording') return;
-  const elapsed = Math.floor((Date.now() - state.recStartTime) / 1000);
-  const hrs = Math.floor(elapsed / 3600);
-  const mins = Math.floor((elapsed % 3600) / 60);
-  const secs = elapsed % 60;
-  const timer = $('rec-timer');
+  var elapsed = Math.floor((Date.now() - state.recStartTime) / 1000);
+  var hrs = Math.floor(elapsed / 3600);
+  var mins = Math.floor((elapsed % 3600) / 60);
+  var secs = elapsed % 60;
+  var timer = $('rec-timer');
   if (hrs > 0) {
     timer.textContent = hrs + ':' + String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
   } else {
     timer.textContent = String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
   }
 }
-
-// Init recording state
-fetch('/api/recording/state').then(r => r.json()).then(d => {
-  if (d.state) {
-    setRecState(d.state);
-    if (d.start_time && d.state === 'recording') {
-      state.recStartTime = new Date(d.start_time).getTime();
-      startTimer();
-    }
-  }
-});
 
 // ---- Token stats ----
 function updateTokens() {
@@ -518,12 +894,18 @@ function updateTokens() {
 
 // ---- Transcript ----
 function addTranscript(data) {
-  const feed = $('transcript-feed');
+  var feed = $('transcript-feed');
   if (feed.querySelector('.empty')) feed.innerHTML = '';
-  const entry = document.createElement('div');
+  var entry = document.createElement('div');
   entry.className = 'transcript-entry';
-  const time = new Date(data.timestamp).toLocaleTimeString();
-  entry.innerHTML = '<div class="time">' + time + '</div>'
+  var time = new Date(data.timestamp).toLocaleTimeString();
+  var speakerTags = '';
+  if (data.speakers && data.speakers.length > 0) {
+    speakerTags = data.speakers.map(function(s) {
+      return '<span class="speaker-tag">' + escHtml(s) + '</span>';
+    }).join('');
+  }
+  entry.innerHTML = '<div class="time">' + time + speakerTags + '</div>'
     + '<div class="text">' + escHtml(data.transcript) + '</div>'
     + (data.summary ? '<div class="summary">' + escHtml(data.summary) + '</div>' : '');
   feed.appendChild(entry);
@@ -532,15 +914,15 @@ function addTranscript(data) {
 
 // ---- Tasks ----
 function addTask(task) {
-  const list = $('tasks-list');
+  var list = $('tasks-list');
   if (list.querySelector('.empty')) list.innerHTML = '';
   state.taskCount++;
   $('tasks-count').textContent = '(' + state.taskCount + ')';
 
-  const item = document.createElement('div');
+  var item = document.createElement('div');
   item.className = 'task-item';
   item.id = 'task-' + (task.id || Date.now());
-  const p = task.priority || 'medium';
+  var p = task.priority || 'medium';
   item.innerHTML = '<span class="priority ' + p + '">' + p.toUpperCase() + '</span>'
     + '<div class="desc">' + escHtml(task.description)
     + (task.assignee ? '<div class="assignee">-> ' + escHtml(task.assignee) + '</div>' : '')
@@ -551,9 +933,9 @@ function addTask(task) {
 }
 
 function addDecisionOrQuestion(type, text) {
-  const feed = $('decisions-feed');
+  var feed = $('decisions-feed');
   if (feed.querySelector('.empty')) feed.innerHTML = '';
-  const el = document.createElement('div');
+  var el = document.createElement('div');
   el.className = type;
   el.textContent = text;
   feed.appendChild(el);
@@ -564,9 +946,9 @@ function addTag(tag) {
   if (state.tags.has(tag)) return;
   state.tags.add(tag);
   $('tags-count').textContent = '(' + state.tags.size + ')';
-  const list = $('tags-list');
+  var list = $('tags-list');
   if (list.querySelector('.empty')) list.innerHTML = '';
-  const el = document.createElement('span');
+  var el = document.createElement('span');
   el.className = 'tag';
   el.textContent = '#' + tag;
   list.appendChild(el);
@@ -574,9 +956,10 @@ function addTag(tag) {
 
 // ---- Streaming ----
 function handleStreamToken(token) {
-  const feed = $('transcript-feed');
+  var feed = $('transcript-feed');
   if (feed.querySelector('.empty')) feed.innerHTML = '';
-  let streaming = document.getElementById('streaming-entry');
+  $('streaming-indicator').classList.add('active');
+  var streaming = document.getElementById('streaming-entry');
   if (!streaming) {
     streaming = document.createElement('div');
     streaming.id = 'streaming-entry';
@@ -584,36 +967,37 @@ function handleStreamToken(token) {
     streaming.innerHTML = '<div class="time">' + new Date().toLocaleTimeString() + '</div><div class="text" id="streaming-text"></div>';
     feed.appendChild(streaming);
   }
-  const textEl = document.getElementById('streaming-text');
+  var textEl = document.getElementById('streaming-text');
   if (textEl) textEl.textContent += token;
   feed.scrollTop = feed.scrollHeight;
 }
 
 function handleStreamComplete() {
-  const el = document.getElementById('streaming-entry');
+  $('streaming-indicator').classList.remove('active');
+  var el = document.getElementById('streaming-entry');
   if (el) el.removeAttribute('id');
-  const textEl = document.getElementById('streaming-text');
+  var textEl = document.getElementById('streaming-text');
   if (textEl) textEl.removeAttribute('id');
 }
 
 function markDone(taskId) {
   fetch('/api/tasks/' + taskId + '/done', { method: 'POST' })
-    .then(() => {
-      const el = document.getElementById('task-' + taskId);
+    .then(function() {
+      var el = document.getElementById('task-' + taskId);
       if (el) el.style.opacity = '0.4';
     });
 }
 
 function escHtml(s) {
-  const d = document.createElement('div');
+  var d = document.createElement('div');
   d.textContent = s || '';
   return d.innerHTML;
 }
 
 // ---- Recordings ----
 function loadRecordings() {
-  fetch('/api/recordings').then(r => r.json()).then(recs => {
-    const list = $('recordings-list');
+  fetch('/api/recordings').then(function(r) { return r.json(); }).then(function(recs) {
+    var list = $('recordings-list');
     list.innerHTML = '';
     if (!recs || recs.length === 0) {
       list.innerHTML = '<div class="empty">No recordings yet</div>';
@@ -621,13 +1005,13 @@ function loadRecordings() {
       return;
     }
     $('rec-count').textContent = '(' + recs.length + ')';
-    recs.forEach(rec => {
-      const item = document.createElement('div');
+    recs.forEach(function(rec) {
+      var item = document.createElement('div');
       item.className = 'recording-item';
-      const time = new Date(rec.created_at).toLocaleString();
-      const dur = formatDuration(rec.duration_seconds);
-      const transcript = rec.transcript ? rec.transcript.substring(0, 120) : 'No transcript';
-      const isPlaying = state.currentRecId === rec.id && state.isPlaying;
+      var time = new Date(rec.created_at).toLocaleString();
+      var dur = formatDuration(rec.duration_seconds);
+      var transcript = rec.transcript ? rec.transcript.substring(0, 120) : 'No transcript';
+      var isPlaying = state.currentRecId === rec.id && state.isPlaying;
       item.innerHTML = '<button class="rec-play-btn' + (isPlaying ? ' playing' : '') + '" onclick="playRecording(' + rec.id + ')" title="Play">'
         + (isPlaying ? '&#9632;' : '&#9654;') + '</button>'
         + '<div class="rec-info">'
@@ -643,14 +1027,14 @@ function loadRecordings() {
 
 function formatDuration(secs) {
   if (!secs) return '0s';
-  const m = Math.floor(secs / 60);
-  const s = Math.round(secs % 60);
+  var m = Math.floor(secs / 60);
+  var s = Math.round(secs % 60);
   return m > 0 ? m + 'm ' + s + 's' : s + 's';
 }
 
 function playRecording(recId) {
-  const audio = $('audio-el');
-  const bar = $('audio-player-bar');
+  var audio = $('audio-el');
+  var bar = $('audio-player-bar');
 
   if (state.currentRecId === recId && state.isPlaying) {
     audio.pause();
@@ -669,7 +1053,7 @@ function playRecording(recId) {
 }
 
 function togglePlayer() {
-  const audio = $('audio-el');
+  var audio = $('audio-el');
   if (state.isPlaying) {
     audio.pause();
     state.isPlaying = false;
@@ -681,29 +1065,24 @@ function togglePlayer() {
 }
 
 function updatePlayerUI() {
-  const btn = $('player-play-btn');
+  var btn = $('player-play-btn');
   btn.innerHTML = state.isPlaying ? '&#9646;&#9646;' : '&#9654;';
-  // Update recording list play buttons too
-  document.querySelectorAll('.rec-play-btn').forEach(b => {
+  document.querySelectorAll('.rec-play-btn').forEach(function(b) {
     b.classList.remove('playing');
     b.innerHTML = '&#9654;';
   });
-  if (state.isPlaying && state.currentRecId) {
-    // Highlight the playing recording button
-    loadRecordings();
-  }
 }
 
 function seekPlayer(e) {
-  const audio = $('audio-el');
+  var audio = $('audio-el');
   if (!audio.duration) return;
-  const rect = $('player-progress').getBoundingClientRect();
-  const pct = (e.clientX - rect.left) / rect.width;
+  var rect = $('player-progress').getBoundingClientRect();
+  var pct = (e.clientX - rect.left) / rect.width;
   audio.currentTime = pct * audio.duration;
 }
 
 function closePlayer() {
-  const audio = $('audio-el');
+  var audio = $('audio-el');
   audio.pause();
   audio.src = '';
   state.isPlaying = false;
@@ -712,13 +1091,13 @@ function closePlayer() {
 }
 
 // Audio element events
-const audioEl = $('audio-el');
+var audioEl = $('audio-el');
 audioEl.addEventListener('timeupdate', function() {
-  const cur = audioEl.currentTime;
-  const dur = audioEl.duration || 0;
+  var cur = audioEl.currentTime;
+  var dur = audioEl.duration || 0;
   $('player-current-time').textContent = formatTime(cur);
   $('player-total-time').textContent = formatTime(dur);
-  const pct = dur > 0 ? (cur / dur) * 100 : 0;
+  var pct = dur > 0 ? (cur / dur) * 100 : 0;
   $('player-progress-fill').style.width = pct + '%';
 });
 audioEl.addEventListener('ended', function() {
@@ -728,24 +1107,113 @@ audioEl.addEventListener('ended', function() {
 
 function formatTime(secs) {
   if (!secs || isNaN(secs)) return '0:00';
-  const m = Math.floor(secs / 60);
-  const s = Math.floor(secs % 60);
+  var m = Math.floor(secs / 60);
+  var s = Math.floor(secs % 60);
   return m + ':' + String(s).padStart(2, '0');
+}
+
+// ---- Voice Prints ----
+var vpColors = ['#3498db', '#e74c3c', '#2ecc71', '#9b59b6', '#e67e22', '#1abc9c', '#f39c12', '#d35400'];
+
+function loadVoicePrints() {
+  fetch('/api/voice-prints').then(function(r) { return r.json(); }).then(function(vps) {
+    var list = $('voice-prints-list');
+    list.innerHTML = '';
+    state.voicePrints = vps;
+    if (!vps || vps.length === 0) {
+      list.innerHTML = '<div class="empty">No voice prints detected yet. Record audio and click STOP to analyze.</div>';
+      $('vp-count').textContent = '';
+      return;
+    }
+    $('vp-count').textContent = '(' + vps.length + ')';
+    vps.forEach(function(vp, idx) {
+      var item = document.createElement('div');
+      item.className = 'vp-item';
+      var color = vpColors[idx % vpColors.length];
+      var initial = (vp.label || 'V')[0].toUpperCase();
+      var mappedText = vp.mapped_speaker_name
+        ? 'Mapped to: ' + escHtml(vp.mapped_speaker_name)
+        : 'Not mapped to a person';
+      item.innerHTML = '<div class="vp-avatar" style="background:' + color + ';color:white;">' + initial + '</div>'
+        + '<div class="vp-info">'
+        + '<div class="vp-label" onclick="renameVoicePrint(' + vp.id + ')" title="Click to rename">' + escHtml(vp.label || 'Voice ' + vp.id) + '</div>'
+        + '<div class="vp-meta">Samples: ' + vp.sample_count + ' | Created: ' + new Date(vp.created_at).toLocaleDateString() + '</div>'
+        + '<div class="vp-mapped">' + mappedText + '</div>'
+        + '</div>'
+        + '<div class="vp-actions">'
+        + '<button class="map-btn" onclick="mapVoicePrint(' + vp.id + ')">Map to Person</button>'
+        + '<button onclick="renameVoicePrint(' + vp.id + ')">Rename</button>'
+        + '<button class="delete-btn" onclick="deleteVoicePrint(' + vp.id + ')">Delete</button>'
+        + '</div>';
+      list.appendChild(item);
+    });
+  });
+}
+
+function renameVoicePrint(id) {
+  var vp = state.voicePrints.find(function(v) { return v.id === id; });
+  var current = vp ? vp.label : '';
+  var newLabel = prompt('Rename voice print:', current);
+  if (newLabel && newLabel !== current) {
+    fetch('/api/voice-prints/' + id, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: newLabel }),
+    }).then(function() { loadVoicePrints(); });
+  }
+}
+
+function mapVoicePrint(vpId) {
+  // Load speakers for mapping
+  fetch('/api/speakers').then(function(r) { return r.json(); }).then(function(speakers) {
+    if (!speakers || speakers.length === 0) {
+      var name = prompt('No enrolled speakers. Enter a name to create a new speaker mapping:');
+      if (name) {
+        // Just rename the voice print to the person's name
+        fetch('/api/voice-prints/' + vpId, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label: name }),
+        }).then(function() { loadVoicePrints(); });
+      }
+      return;
+    }
+    var options = speakers.map(function(s) { return s.id + ': ' + s.name; }).join('\\n');
+    var choice = prompt('Map to which speaker?\\n' + options + '\\n\\nEnter speaker ID:');
+    if (choice) {
+      var speakerId = parseInt(choice);
+      if (!isNaN(speakerId)) {
+        fetch('/api/voice-prints/' + vpId + '/map', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ speaker_id: speakerId }),
+        }).then(function() { loadVoicePrints(); });
+      }
+    }
+  });
+}
+
+function deleteVoicePrint(id) {
+  if (confirm('Delete this voice print?')) {
+    fetch('/api/voice-prints/' + id, { method: 'DELETE' })
+      .then(function() { loadVoicePrints(); });
+  }
 }
 
 // ---- Speakers ----
 function loadSpeakers() {
-  fetch('/api/speakers').then(r => r.json()).then(speakers => {
-    const list = $('speakers-list');
+  fetch('/api/speakers').then(function(r) { return r.json(); }).then(function(speakers) {
+    var list = $('speakers-list');
     list.innerHTML = '';
+    state.speakers = speakers;
     if (!speakers || speakers.length === 0) {
       list.innerHTML = '<div class="empty">No speakers enrolled</div>';
       return;
     }
-    speakers.forEach(sp => {
-      const item = document.createElement('div');
+    speakers.forEach(function(sp) {
+      var item = document.createElement('div');
       item.className = 'speaker-item';
-      const initials = sp.name.split(' ').map(w => w[0]).join('').toUpperCase().substring(0, 2);
+      var initials = sp.name.split(' ').map(function(w) { return w[0]; }).join('').toUpperCase().substring(0, 2);
       item.innerHTML = '<div class="speaker-avatar">' + escHtml(initials) + '</div>'
         + '<div class="speaker-info">'
         + '<div class="speaker-name" id="speaker-name-' + sp.id + '">' + escHtml(sp.name) + '</div>'
@@ -760,29 +1228,46 @@ function loadSpeakers() {
 }
 
 function renameSpeaker(id) {
-  const nameEl = document.getElementById('speaker-name-' + id);
+  var nameEl = document.getElementById('speaker-name-' + id);
   if (!nameEl) return;
-  const current = nameEl.textContent;
-  const newName = prompt('Rename speaker:', current);
+  var current = nameEl.textContent;
+  var newName = prompt('Rename speaker:', current);
   if (newName && newName !== current) {
     fetch('/api/speakers/' + id, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: newName }),
-    }).then(r => r.json()).then(() => {
+    }).then(function(r) { return r.json(); }).then(function() {
       nameEl.textContent = newName;
     });
   }
 }
 
-// ---- Load initial data ----
-fetch('/api/tasks').then(r => r.json()).then(tasks => {
-  tasks.forEach(t => addTask(t));
+// ---- Initialize ----
+// Try WebSocket first, fall back to SSE
+connectWS();
+
+// Also set up SSE as fallback for older browsers
+function connectSSE() {
+  var es = new EventSource('/api/events');
+  es.onmessage = function(e) {
+    var msg = JSON.parse(e.data);
+    handleEvent(msg);
+  };
+  es.onerror = function() {
+    es.close();
+    setTimeout(connectSSE, 3000);
+  };
+}
+
+// Load initial data
+fetch('/api/tasks').then(function(r) { return r.json(); }).then(function(tasks) {
+  tasks.forEach(function(t) { addTask(t); });
 });
-fetch('/api/tags').then(r => r.json()).then(tags => {
-  tags.forEach(t => addTag(t.tag));
+fetch('/api/tags').then(function(r) { return r.json(); }).then(function(tags) {
+  tags.forEach(function(t) { addTag(t.tag); });
 });
-fetch('/api/stats').then(r => r.json()).then(s => {
+fetch('/api/stats').then(function(r) { return r.json(); }).then(function(s) {
   if (s.total_input_tokens) {
     state.tokensIn = s.total_input_tokens;
     state.tokensOut = s.total_output_tokens;
@@ -793,59 +1278,23 @@ fetch('/api/stats').then(r => r.json()).then(s => {
   }
 });
 
-// ---- SSE connection ----
-function connectSSE() {
-  const es = new EventSource('/api/events');
-  es.onmessage = function(e) {
-    const msg = JSON.parse(e.data);
-    const d = msg.data;
-    switch (msg.type) {
-      case 'insight':
-        if (d.transcript) addTranscript({transcript: d.transcript, summary: d.summary, timestamp: msg.timestamp});
-        (d.tasks || []).forEach(t => addTask(t));
-        (d.decisions || []).forEach(dec => addDecisionOrQuestion('decision', dec));
-        (d.questions || []).forEach(q => addDecisionOrQuestion('question', q));
-        (d.hashtags || []).forEach(h => addTag(h.tag || h));
-        if (d.token_usage) {
-          state.tokensIn += d.token_usage.input_tokens || 0;
-          state.tokensOut += d.token_usage.output_tokens || 0;
-          state.tokensTotal += d.token_usage.total_tokens || 0;
-        }
-        state.chunks++;
-        state.speechSecs += d.duration_seconds || 0;
-        updateTokens();
-        break;
-      case 'session_started':
-        break;
-      case 'session_ended':
-        break;
-      case 'stream_token':
-        handleStreamToken(d.token || '');
-        break;
-      case 'stream_complete':
-        handleStreamComplete();
-        break;
-      case 'task_completed':
-        var el = document.getElementById('task-' + d.task_id);
-        if (el) el.style.opacity = '0.4';
-        break;
-      case 'recording_state':
-        setRecState(d.state);
-        break;
+// Init recording state
+fetch('/api/recording/state').then(function(r) { return r.json(); }).then(function(d) {
+  if (d.state) {
+    setRecState(d.state);
+    if (d.start_time && d.state === 'recording') {
+      state.recStartTime = new Date(d.start_time).getTime();
+      startTimer();
     }
-  };
-  es.onerror = function() {
-    $('connection').textContent = '\\u25cf Reconnecting...';
-    $('connection').style.color = 'var(--red)';
-    es.close();
-    setTimeout(connectSSE, 3000);
-  };
-  es.onopen = function() {
-    $('connection').textContent = '\\u25cf Connected';
-    $('connection').style.color = 'var(--green)';
-  };
-}
-connectSSE();
+  }
+});
+
+// WebSocket keepalive ping
+setInterval(function() {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify({type: 'ping'}));
+  }
+}, 30000);
 </script>
 </body>
 </html>
