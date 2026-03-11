@@ -31,6 +31,7 @@ from src.models.models import (
     Insight,
     Priority,
     Task,
+    TokenUsage,
     TranscriptSegment,
 )
 
@@ -156,7 +157,18 @@ class GeminiProcessor:
             ),
         )
 
-        return self._parse_response(response.text)
+        insight = self._parse_response(response.text)
+
+        # Capture token usage from response metadata
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            insight.token_usage = TokenUsage(
+                input_tokens=getattr(usage, "prompt_token_count", 0) or 0,
+                output_tokens=getattr(usage, "candidates_token_count", 0) or 0,
+                total_tokens=getattr(usage, "total_token_count", 0) or 0,
+            )
+
+        return insight
 
     def _parse_response(self, text: str) -> Insight:
         """Parse Gemini's JSON response into an Insight object."""

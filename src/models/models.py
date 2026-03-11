@@ -74,6 +74,15 @@ class TranscriptSegment:
 
 
 @dataclass
+class TokenUsage:
+    """Token usage from a Gemini API call."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+
+
+@dataclass
 class Insight:
     """Structured insight extracted by Gemini from a chunk."""
 
@@ -86,6 +95,7 @@ class Insight:
     questions: list[str] = field(default_factory=list)  # Open questions raised
     language: str = "en"
     audio_type: AudioType = AudioType.SPEECH
+    token_usage: Optional[TokenUsage] = None
 
 
 @dataclass

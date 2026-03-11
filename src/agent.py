@@ -64,6 +64,9 @@ class DeskVoiceAgent:
             "gemini_calls": 0,
             "tasks_found": 0,
             "sessions_completed": 0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_tokens": 0,
         }
 
     # ------------------------------------------------------------------
@@ -171,6 +174,20 @@ class DeskVoiceAgent:
             self._save_audio_chunk(chunk)
             return
 
+        # Log token usage immediately
+        if insight.token_usage:
+            tu = insight.token_usage
+            self._stats["total_input_tokens"] += tu.input_tokens
+            self._stats["total_output_tokens"] += tu.output_tokens
+            self._stats["total_tokens"] += tu.total_tokens
+            logger.info(
+                "[tokens] in=%d out=%d total=%d (cumulative: %d)",
+                tu.input_tokens,
+                tu.output_tokens,
+                tu.total_tokens,
+                self._stats["total_tokens"],
+            )
+
         # Step 3: Check if Gemini thinks this isn't actually speech
         if insight.audio_type in (AudioType.MUSIC, AudioType.NOISE):
             logger.info("Gemini classified as %s, skipping storage", insight.audio_type.value)
@@ -188,13 +205,22 @@ class DeskVoiceAgent:
         self._stats["speech_seconds"] += chunk.duration_seconds
         self._stats["tasks_found"] += len(insight.tasks)
 
-        # Log activity
+        # Log activity in real-time
         if insight.transcript:
-            preview = insight.transcript[:80] + ("..." if len(insight.transcript) > 80 else "")
+            preview = insight.transcript[:120] + ("..." if len(insight.transcript) > 120 else "")
             logger.info("[transcript] %s", preview)
         if insight.tasks:
             for task in insight.tasks:
-                logger.info("[task] %s (assigned: %s)", task.description, task.assignee or "unassigned")
+                priority_marker = {"high": "!!!", "medium": "!!", "low": "!"}.get(task.priority.value, "")
+                assignee = f" -> {task.assignee}" if task.assignee else ""
+                due = f" (due: {task.due_hint})" if task.due_hint else ""
+                logger.info("[task] %s %s%s%s", priority_marker, task.description, assignee, due)
+        if insight.decisions:
+            for decision in insight.decisions:
+                logger.info("[decision] %s", decision)
+        if insight.questions:
+            for question in insight.questions:
+                logger.info("[question] %s", question)
         if insight.hashtags:
             tags = ", ".join(f"#{h.tag}" for h in insight.hashtags)
             logger.info("[tags] %s", tags)
