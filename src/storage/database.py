@@ -79,12 +79,40 @@ CREATE TABLE IF NOT EXISTS recordings (
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
 
+CREATE TABLE IF NOT EXISTS voice_prints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL DEFAULT '',
+    voice_embedding BLOB NOT NULL,
+    sample_count INTEGER DEFAULT 1,
+    mapped_speaker_id INTEGER DEFAULT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (mapped_speaker_id) REFERENCES speakers(id)
+);
+
+CREATE TABLE IF NOT EXISTS recording_segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recording_id INTEGER NOT NULL,
+    voice_print_id INTEGER,
+    speaker_label TEXT DEFAULT '',
+    text TEXT DEFAULT '',
+    start_seconds REAL DEFAULT 0,
+    end_seconds REAL DEFAULT 0,
+    confidence REAL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (recording_id) REFERENCES recordings(id),
+    FOREIGN KEY (voice_print_id) REFERENCES voice_prints(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
 CREATE INDEX IF NOT EXISTS idx_hashtags_tag ON hashtags(tag);
 CREATE INDEX IF NOT EXISTS idx_hashtags_session ON hashtags(session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_recordings_session ON recordings(session_id);
+CREATE INDEX IF NOT EXISTS idx_voice_prints_mapped ON voice_prints(mapped_speaker_id);
+CREATE INDEX IF NOT EXISTS idx_recording_segments_recording ON recording_segments(recording_id);
+CREATE INDEX IF NOT EXISTS idx_recording_segments_voice_print ON recording_segments(voice_print_id);
 
 -- Full-text search on transcripts
 CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
@@ -422,6 +450,121 @@ class Database:
         """Get a single recording by ID."""
         row = self.conn.execute("SELECT * FROM recordings WHERE id = ?", (recording_id,)).fetchone()
         return dict(row) if row else None
+
+    # ------------------------------------------------------------------
+    # Voice Prints
+    # ------------------------------------------------------------------
+
+    def add_voice_print(self, label: str, embedding: bytes) -> int:
+        """Add a new auto-detected voice print."""
+        now = datetime.now().isoformat()
+        cursor = self.conn.execute(
+            "INSERT INTO voice_prints (label, voice_embedding, sample_count, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
+            (label, embedding, now, now),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def update_voice_print_embedding(self, vp_id: int, embedding: bytes, sample_count: int) -> None:
+        """Update a voice print's averaged embedding."""
+        self.conn.execute(
+            "UPDATE voice_prints SET voice_embedding = ?, sample_count = ?, updated_at = ? WHERE id = ?",
+            (embedding, sample_count, datetime.now().isoformat(), vp_id),
+        )
+        self.conn.commit()
+
+    def list_voice_prints(self) -> list[dict]:
+        """List all voice prints with their mapped speaker names."""
+        rows = self.conn.execute(
+            """SELECT vp.id, vp.label, vp.sample_count, vp.mapped_speaker_id,
+                      vp.created_at, vp.updated_at,
+                      s.name as mapped_speaker_name
+               FROM voice_prints vp
+               LEFT JOIN speakers s ON vp.mapped_speaker_id = s.id
+               ORDER BY vp.id DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_voice_print_embeddings(self) -> list[tuple[int, str, bytes, int]]:
+        """Get all voice print embeddings for matching. Returns (id, label, embedding, sample_count)."""
+        rows = self.conn.execute(
+            """SELECT vp.id, COALESCE(s.name, vp.label) as label, vp.voice_embedding, vp.sample_count
+               FROM voice_prints vp
+               LEFT JOIN speakers s ON vp.mapped_speaker_id = s.id"""
+        ).fetchall()
+        return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+    def map_voice_print_to_speaker(self, vp_id: int, speaker_id: int) -> None:
+        """Map a voice print to a known speaker."""
+        self.conn.execute(
+            "UPDATE voice_prints SET mapped_speaker_id = ?, updated_at = ? WHERE id = ?",
+            (speaker_id, datetime.now().isoformat(), vp_id),
+        )
+        self.conn.commit()
+
+    def rename_voice_print(self, vp_id: int, label: str) -> None:
+        """Rename a voice print label."""
+        self.conn.execute(
+            "UPDATE voice_prints SET label = ?, updated_at = ? WHERE id = ?",
+            (label, datetime.now().isoformat(), vp_id),
+        )
+        self.conn.commit()
+
+    def merge_voice_prints(self, keep_id: int, merge_id: int) -> None:
+        """Merge two voice prints — reassign segments and delete the merged one."""
+        self.conn.execute(
+            "UPDATE recording_segments SET voice_print_id = ? WHERE voice_print_id = ?",
+            (keep_id, merge_id),
+        )
+        self.conn.execute("DELETE FROM voice_prints WHERE id = ?", (merge_id,))
+        self.conn.commit()
+
+    def delete_voice_print(self, vp_id: int) -> None:
+        """Delete a voice print."""
+        self.conn.execute(
+            "UPDATE recording_segments SET voice_print_id = NULL WHERE voice_print_id = ?",
+            (vp_id,),
+        )
+        self.conn.execute("DELETE FROM voice_prints WHERE id = ?", (vp_id,))
+        self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Recording Segments
+    # ------------------------------------------------------------------
+
+    def add_recording_segment(
+        self,
+        recording_id: int,
+        voice_print_id: Optional[int],
+        speaker_label: str,
+        text: str,
+        start_seconds: float,
+        end_seconds: float,
+        confidence: float = 0.0,
+    ) -> int:
+        """Add a segment within a recording."""
+        cursor = self.conn.execute(
+            """INSERT INTO recording_segments
+               (recording_id, voice_print_id, speaker_label, text, start_seconds, end_seconds, confidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (recording_id, voice_print_id, speaker_label, text,
+             start_seconds, end_seconds, confidence, datetime.now().isoformat()),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_recording_segments(self, recording_id: int) -> list[dict]:
+        """Get all segments for a recording with voice print info."""
+        rows = self.conn.execute(
+            """SELECT rs.*, COALESCE(s.name, vp.label, rs.speaker_label) as resolved_speaker
+               FROM recording_segments rs
+               LEFT JOIN voice_prints vp ON rs.voice_print_id = vp.id
+               LEFT JOIN speakers s ON vp.mapped_speaker_id = s.id
+               WHERE rs.recording_id = ?
+               ORDER BY rs.start_seconds""",
+            (recording_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Search
