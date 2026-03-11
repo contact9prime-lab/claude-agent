@@ -1,0 +1,21 @@
+services:
+  deskvoice:
+    build: .
+    image: deskvoice:latest
+    container_name: deskvoice
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Persist transcripts and audio
+      - deskvoice-data:/data
+      # Pass host PulseAudio socket for audio capture
+      # Linux: this just works
+      # macOS: requires pulseaudio running with module-native-protocol-unix
+      - ${PULSE_SOCKET:-/run/user/1000/pulse/native}:/tmp/pulseaudio.socket
+      # PulseAudio cookie for auth
+      - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
+    environment:
+      - PULSE_SERVER=unix:/tmp/pulseaudio.socket
+
+volumes:
+  deskvoice-data:
