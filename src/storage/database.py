@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS voice_prints (
     label TEXT NOT NULL DEFAULT '',
     voice_embedding BLOB NOT NULL,
     sample_count INTEGER DEFAULT 1,
+    audio_sample_file TEXT DEFAULT '',
     mapped_speaker_id INTEGER DEFAULT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -126,7 +127,8 @@ MIGRATIONS = [
     # Add reminder_at and edited_at to tasks if missing
     ("ALTER TABLE tasks ADD COLUMN reminder_at TEXT DEFAULT ''", "tasks", "reminder_at"),
     ("ALTER TABLE tasks ADD COLUMN edited_at TEXT DEFAULT ''", "tasks", "edited_at"),
-    # Add speakers table (handled by schema, but migration for existing DBs)
+    # Add audio_sample_file to voice_prints for existing DBs
+    ("ALTER TABLE voice_prints ADD COLUMN audio_sample_file TEXT DEFAULT ''", "voice_prints", "audio_sample_file"),
 ]
 
 
@@ -455,12 +457,12 @@ class Database:
     # Voice Prints
     # ------------------------------------------------------------------
 
-    def add_voice_print(self, label: str, embedding: bytes) -> int:
+    def add_voice_print(self, label: str, embedding: bytes, audio_sample_file: str = "") -> int:
         """Add a new auto-detected voice print."""
         now = datetime.now().isoformat()
         cursor = self.conn.execute(
-            "INSERT INTO voice_prints (label, voice_embedding, sample_count, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
-            (label, embedding, now, now),
+            "INSERT INTO voice_prints (label, voice_embedding, sample_count, audio_sample_file, created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?)",
+            (label, embedding, audio_sample_file, now, now),
         )
         self.conn.commit()
         return cursor.lastrowid
@@ -473,11 +475,19 @@ class Database:
         )
         self.conn.commit()
 
+    def update_voice_print_audio(self, vp_id: int, audio_sample_file: str) -> None:
+        """Update the audio sample file for a voice print."""
+        self.conn.execute(
+            "UPDATE voice_prints SET audio_sample_file = ?, updated_at = ? WHERE id = ?",
+            (audio_sample_file, datetime.now().isoformat(), vp_id),
+        )
+        self.conn.commit()
+
     def list_voice_prints(self) -> list[dict]:
         """List all voice prints with their mapped speaker names."""
         rows = self.conn.execute(
             """SELECT vp.id, vp.label, vp.sample_count, vp.mapped_speaker_id,
-                      vp.created_at, vp.updated_at,
+                      vp.audio_sample_file, vp.created_at, vp.updated_at,
                       s.name as mapped_speaker_name
                FROM voice_prints vp
                LEFT JOIN speakers s ON vp.mapped_speaker_id = s.id

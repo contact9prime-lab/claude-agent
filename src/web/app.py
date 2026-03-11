@@ -290,8 +290,34 @@ def create_app(config: AgentConfig) -> FastAPI:
     # --- Voice Print endpoints ---
     @app.get("/api/voice-prints")
     def get_voice_prints():
-        """List all detected voice prints."""
-        return db.list_voice_prints()
+        """List all detected voice prints with segment info."""
+        vps = db.list_voice_prints()
+        # Enrich with segment counts and text snippets
+        for vp in vps:
+            # Get segments associated with this voice print
+            segments = db.conn.execute(
+                """SELECT rs.text, rs.start_seconds, rs.end_seconds, rs.recording_id, r.filename
+                   FROM recording_segments rs
+                   LEFT JOIN recordings r ON rs.recording_id = r.id
+                   WHERE rs.voice_print_id = ?
+                   ORDER BY rs.created_at DESC LIMIT 10""",
+                (vp["id"],),
+            ).fetchall()
+            vp["segments"] = [dict(s) for s in segments]
+            vp["has_audio"] = bool(vp.get("audio_sample_file"))
+        return vps
+
+    @app.get("/api/voice-prints/{vp_id}/audio")
+    def get_voice_print_audio(vp_id: int):
+        """Serve the audio sample for a voice print."""
+        vps = db.list_voice_prints()
+        vp = next((v for v in vps if v["id"] == vp_id), None)
+        if not vp or not vp.get("audio_sample_file"):
+            return {"error": "No audio sample available for this voice print"}
+        audio_path = config.storage.audio_dir / vp["audio_sample_file"]
+        if not audio_path.exists():
+            return {"error": "Audio file not found"}
+        return FileResponse(audio_path, media_type="audio/wav", filename=vp["audio_sample_file"])
 
     @app.put("/api/voice-prints/{vp_id}")
     async def update_voice_print(vp_id: int, request: Request):
@@ -499,19 +525,29 @@ DASHBOARD_HTML = """\
   .audio-player-bar .player-close:hover { color: var(--text); }
 
   /* Voice prints section */
-  .vp-item { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #ffffff10; }
-  .vp-item .vp-avatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.8em; font-weight: bold; flex-shrink: 0; }
+  .vp-item { background: var(--surface2); border: 1px solid var(--accent); border-radius: 8px; padding: 14px; margin-bottom: 10px; }
+  .vp-item-header { display: flex; align-items: center; gap: 10px; }
+  .vp-item .vp-avatar { width: 42px; height: 42px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1em; font-weight: bold; flex-shrink: 0; }
   .vp-item .vp-info { flex: 1; }
-  .vp-item .vp-label { font-size: 0.9em; cursor: pointer; }
-  .vp-item .vp-label:hover { color: var(--green); }
-  .vp-item .vp-meta { font-size: 0.75em; color: var(--text-dim); }
-  .vp-item .vp-mapped { font-size: 0.75em; color: var(--green); }
-  .vp-item .vp-actions { display: flex; gap: 4px; }
-  .vp-item .vp-actions button { background: var(--accent); border: none; color: var(--text-dim); padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 0.75em; font-family: inherit; }
-  .vp-item .vp-actions button:hover { color: var(--text); background: var(--surface2); }
-  .vp-item .vp-actions .map-btn { color: var(--green); }
+  .vp-item .vp-label { font-size: 1em; font-weight: bold; cursor: pointer; }
+  .vp-item .vp-label:hover { color: var(--green); text-decoration: underline; }
+  .vp-item .vp-meta { font-size: 0.75em; color: var(--text-dim); margin-top: 2px; }
+  .vp-item .vp-mapped { font-size: 0.75em; color: var(--green); margin-top: 2px; }
+  .vp-item .vp-play-btn { width: 36px; height: 36px; border-radius: 50%; border: 2px solid var(--green); background: transparent; color: var(--green); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 1em; flex-shrink: 0; transition: all 0.2s; }
+  .vp-item .vp-play-btn:hover { background: var(--green); color: black; }
+  .vp-item .vp-play-btn.playing { border-color: var(--red); color: var(--red); }
+  .vp-item .vp-play-btn.playing:hover { background: var(--red); color: white; }
+  .vp-item .vp-play-btn.no-audio { border-color: var(--text-dim); color: var(--text-dim); opacity: 0.5; cursor: not-allowed; }
+  .vp-item .vp-segments { margin-top: 8px; padding-top: 8px; border-top: 1px solid #ffffff10; }
+  .vp-item .vp-segment-text { font-size: 0.8em; color: var(--text-dim); line-height: 1.4; margin-bottom: 4px; padding-left: 8px; border-left: 2px solid; }
+  .vp-item .vp-actions { display: flex; gap: 6px; margin-top: 10px; }
+  .vp-item .vp-actions button { background: var(--accent); border: none; color: var(--text-dim); padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 0.75em; font-family: inherit; transition: all 0.2s; }
+  .vp-item .vp-actions button:hover { color: var(--text); background: var(--surface); }
+  .vp-item .vp-actions .map-btn { color: var(--green); border: 1px solid var(--green); background: transparent; }
+  .vp-item .vp-actions .map-btn:hover { background: var(--green); color: black; }
   .vp-item .vp-actions .delete-btn { color: var(--red); }
-  #voice-prints-list { max-height: 400px; overflow-y: auto; }
+  .vp-item .vp-actions .delete-btn:hover { background: var(--red); color: white; }
+  #voice-prints-list { max-height: none; overflow-y: auto; }
 
   /* Speakers / voiceprint section */
   .speaker-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #ffffff10; }
@@ -1155,6 +1191,7 @@ function formatTime(secs) {
 
 // ---- Voice Prints ----
 var vpColors = ['#3498db', '#e74c3c', '#2ecc71', '#9b59b6', '#e67e22', '#1abc9c', '#f39c12', '#d35400'];
+state.vpPlayingId = null;
 
 function loadVoicePrints() {
   fetch('/api/voice-prints').then(function(r) { return r.json(); }).then(function(vps) {
@@ -1173,21 +1210,138 @@ function loadVoicePrints() {
       var color = vpColors[idx % vpColors.length];
       var initial = (vp.label || 'V')[0].toUpperCase();
       var mappedText = vp.mapped_speaker_name
-        ? 'Mapped to: ' + escHtml(vp.mapped_speaker_name)
-        : 'Not mapped to a person';
-      item.innerHTML = '<div class="vp-avatar" style="background:' + color + ';color:white;">' + initial + '</div>'
+        ? '<span style="color:var(--green)">\\u2714 Mapped to: ' + escHtml(vp.mapped_speaker_name) + '</span>'
+        : '<span style="color:var(--yellow)">\\u26A0 Not identified — click "Identify" to name this person</span>';
+
+      // Play button
+      var hasAudio = vp.has_audio;
+      var playBtnClass = hasAudio ? 'vp-play-btn' : 'vp-play-btn no-audio';
+      var playBtn = '<button class="' + playBtnClass + '" id="vp-play-' + vp.id + '" '
+        + (hasAudio ? 'onclick="playVoicePrint(' + vp.id + ')" title="Listen to this voice"' : 'title="No audio sample available"')
+        + '>&#9654;</button>';
+
+      // Segment text snippets
+      var segmentsHtml = '';
+      if (vp.segments && vp.segments.length > 0) {
+        segmentsHtml = '<div class="vp-segments">';
+        var shown = 0;
+        vp.segments.forEach(function(seg) {
+          if (shown >= 3) return;
+          if (seg.text && seg.text.trim()) {
+            segmentsHtml += '<div class="vp-segment-text" style="border-color:' + color + ';">'
+              + '&ldquo;' + escHtml(seg.text.substring(0, 150)) + (seg.text.length > 150 ? '...' : '') + '&rdquo;</div>';
+            shown++;
+          }
+        });
+        if (shown === 0) {
+          segmentsHtml = '';
+        } else {
+          segmentsHtml += '</div>';
+        }
+      }
+
+      item.innerHTML = '<div class="vp-item-header">'
+        + playBtn
+        + '<div class="vp-avatar" style="background:' + color + ';color:white;">' + initial + '</div>'
         + '<div class="vp-info">'
         + '<div class="vp-label" onclick="renameVoicePrint(' + vp.id + ')" title="Click to rename">' + escHtml(vp.label || 'Voice ' + vp.id) + '</div>'
         + '<div class="vp-meta">Samples: ' + vp.sample_count + ' | Created: ' + new Date(vp.created_at).toLocaleDateString() + '</div>'
         + '<div class="vp-mapped">' + mappedText + '</div>'
         + '</div>'
+        + '</div>'
+        + segmentsHtml
         + '<div class="vp-actions">'
-        + '<button class="map-btn" onclick="mapVoicePrint(' + vp.id + ')">Map to Person</button>'
+        + '<button class="map-btn" onclick="identifyVoicePrint(' + vp.id + ')">Identify Person</button>'
         + '<button onclick="renameVoicePrint(' + vp.id + ')">Rename</button>'
         + '<button class="delete-btn" onclick="deleteVoicePrint(' + vp.id + ')">Delete</button>'
         + '</div>';
       list.appendChild(item);
     });
+  });
+}
+
+function playVoicePrint(vpId) {
+  var audio = $('audio-el');
+  var bar = $('audio-player-bar');
+  var btn = document.getElementById('vp-play-' + vpId);
+
+  // If already playing this voice print, stop
+  if (state.vpPlayingId === vpId && state.isPlaying) {
+    audio.pause();
+    state.isPlaying = false;
+    state.vpPlayingId = null;
+    if (btn) { btn.classList.remove('playing'); btn.innerHTML = '&#9654;'; }
+    bar.classList.remove('visible');
+    return;
+  }
+
+  // Reset any other playing vp buttons
+  document.querySelectorAll('.vp-play-btn.playing').forEach(function(b) {
+    b.classList.remove('playing');
+    b.innerHTML = '&#9654;';
+  });
+
+  state.vpPlayingId = vpId;
+  state.currentRecId = null;
+  audio.src = '/api/voice-prints/' + vpId + '/audio';
+  audio.play();
+  state.isPlaying = true;
+
+  if (btn) { btn.classList.add('playing'); btn.innerHTML = '&#9632;'; }
+
+  var vp = state.voicePrints.find(function(v) { return v.id === vpId; });
+  bar.classList.add('visible');
+  $('player-info').textContent = 'Voice: ' + (vp ? vp.label : 'Voice ' + vpId);
+
+  audio.onended = function() {
+    state.isPlaying = false;
+    state.vpPlayingId = null;
+    if (btn) { btn.classList.remove('playing'); btn.innerHTML = '&#9654;'; }
+    bar.classList.remove('visible');
+  };
+}
+
+function identifyVoicePrint(vpId) {
+  var vp = state.voicePrints.find(function(v) { return v.id === vpId; });
+  var currentLabel = vp ? vp.label : '';
+
+  // First, offer to play the audio if available
+  var msg = 'Who is this person?';
+  if (vp && vp.has_audio) {
+    msg = 'Listen to the voice sample, then enter the person\\'s name.\\n\\n(Click the play button next to the voice print to listen)\\n\\nWho is this person?';
+  }
+
+  // Check if we have enrolled speakers to map to
+  fetch('/api/speakers').then(function(r) { return r.json(); }).then(function(speakers) {
+    var name;
+    if (speakers && speakers.length > 0) {
+      var options = speakers.map(function(s) { return s.id + ': ' + s.name; }).join('\\n');
+      var choice = prompt(msg + '\\n\\nExisting speakers:\\n' + options + '\\n\\nEnter speaker ID to map, or type a new name:');
+      if (!choice) return;
+
+      var speakerId = parseInt(choice);
+      if (!isNaN(speakerId) && speakers.some(function(s) { return s.id === speakerId; })) {
+        // Map to existing speaker
+        fetch('/api/voice-prints/' + vpId + '/map', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ speaker_id: speakerId }),
+        }).then(function() { loadVoicePrints(); });
+        return;
+      }
+      name = choice;
+    } else {
+      name = prompt(msg);
+    }
+
+    if (name && name.trim()) {
+      // Rename the voice print to the person's name
+      fetch('/api/voice-prints/' + vpId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: name.trim() }),
+      }).then(function() { loadVoicePrints(); });
+    }
   });
 }
 
@@ -1204,35 +1358,7 @@ function renameVoicePrint(id) {
   }
 }
 
-function mapVoicePrint(vpId) {
-  // Load speakers for mapping
-  fetch('/api/speakers').then(function(r) { return r.json(); }).then(function(speakers) {
-    if (!speakers || speakers.length === 0) {
-      var name = prompt('No enrolled speakers. Enter a name to create a new speaker mapping:');
-      if (name) {
-        // Just rename the voice print to the person's name
-        fetch('/api/voice-prints/' + vpId, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ label: name }),
-        }).then(function() { loadVoicePrints(); });
-      }
-      return;
-    }
-    var options = speakers.map(function(s) { return s.id + ': ' + s.name; }).join('\\n');
-    var choice = prompt('Map to which speaker?\\n' + options + '\\n\\nEnter speaker ID:');
-    if (choice) {
-      var speakerId = parseInt(choice);
-      if (!isNaN(speakerId)) {
-        fetch('/api/voice-prints/' + vpId + '/map', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ speaker_id: speakerId }),
-        }).then(function() { loadVoicePrints(); });
-      }
-    }
-  });
-}
+// mapVoicePrint replaced by identifyVoicePrint above
 
 function deleteVoicePrint(id) {
   if (confirm('Delete this voice print?')) {

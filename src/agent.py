@@ -23,6 +23,7 @@ import threading
 import time
 import wave
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -314,10 +315,42 @@ class DeskVoiceAgent:
                         # Create a new voice print (with empty embedding for LLM-only mode)
                         import pickle
                         empty_embedding = pickle.dumps(b"llm_speaker_label")
-                        vp_id = self._db.add_voice_print(speaker_label, empty_embedding)
+
+                        # Extract audio sample for this speaker
+                        audio_sample = self._save_voice_print_audio_sample(
+                            0, speaker_label, rec["filename"], segments_data
+                        )
+
+                        vp_id = self._db.add_voice_print(
+                            speaker_label, empty_embedding,
+                            audio_sample_file=audio_sample or "",
+                        )
+
+                        # Update the sample filename now that we have the ID
+                        if audio_sample and "voiceprint_0_" in audio_sample:
+                            new_filename = audio_sample.replace("voiceprint_0_", f"voiceprint_{vp_id}_")
+                            old_path = self.config.storage.audio_dir / audio_sample
+                            new_path = self.config.storage.audio_dir / new_filename
+                            if old_path.exists():
+                                old_path.rename(new_path)
+                                self._db.update_voice_print_audio(vp_id, new_filename)
+                                audio_sample = new_filename
+
                         existing_prints.append((vp_id, speaker_label, empty_embedding, 1))
                         result["voice_prints_detected"] += 1
-                        logger.info("Created voice print '%s' (id=%d)", speaker_label, vp_id)
+                        logger.info("Created voice print '%s' (id=%d, audio=%s)",
+                                    speaker_label, vp_id, audio_sample or "none")
+                    else:
+                        # Existing voice print — save audio sample if it doesn't have one
+                        existing_vp = next(
+                            (v for v in self._db.list_voice_prints() if v["id"] == vp_id), None
+                        )
+                        if existing_vp and not existing_vp.get("audio_sample_file"):
+                            audio_sample = self._save_voice_print_audio_sample(
+                                vp_id, speaker_label, rec["filename"], segments_data
+                            )
+                            if audio_sample:
+                                self._db.update_voice_print_audio(vp_id, audio_sample)
 
                     label_to_vp[speaker_label] = vp_id
                     seen_speakers.add((vp_id, speaker_label))
@@ -465,6 +498,101 @@ class DeskVoiceAgent:
                     confidence=0.0,
                 )
                 result["segments_processed"] += 1
+
+    def _extract_audio_segment(self, wav_path: Path, start_sec: float, end_sec: float, out_filename: str) -> Optional[str]:
+        """Extract a time segment from a WAV file and save it as a new file.
+
+        Returns the filename if successful, None otherwise.
+        """
+        try:
+            with wave.open(str(wav_path), "rb") as wf:
+                sr = wf.getframerate()
+                channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                total_frames = wf.getnframes()
+
+                start_frame = int(start_sec * sr)
+                end_frame = min(int(end_sec * sr), total_frames)
+
+                if start_frame >= total_frames or start_frame >= end_frame:
+                    return None
+
+                wf.setpos(start_frame)
+                frames = wf.readframes(end_frame - start_frame)
+
+            out_path = self.config.storage.audio_dir / out_filename
+            with wave.open(str(out_path), "wb") as wf_out:
+                wf_out.setnchannels(channels)
+                wf_out.setsampwidth(sampwidth)
+                wf_out.setframerate(sr)
+                wf_out.writeframes(frames)
+
+            logger.debug("Extracted audio segment: %s (%.1f-%.1fs)", out_filename, start_sec, end_sec)
+            return out_filename
+        except Exception as e:
+            logger.debug("Failed to extract audio segment: %s", e)
+            return None
+
+    def _save_voice_print_audio_sample(
+        self, vp_id: int, speaker_label: str, rec_filename: str,
+        segments_data: list[tuple[float, float, str]]
+    ) -> Optional[str]:
+        """Save a combined audio sample for a voice print from its segments.
+
+        Takes the first few segments (up to ~15 seconds) of a speaker's audio
+        and concatenates them into a single sample file.
+        """
+        audio_path = self.config.storage.audio_dir / rec_filename
+        if not audio_path.exists():
+            return None
+
+        try:
+            with wave.open(str(audio_path), "rb") as wf:
+                sr = wf.getframerate()
+                channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                total_frames = wf.getnframes()
+                all_audio = wf.readframes(total_frames)
+
+            # Concatenate segments for this speaker (up to ~15 seconds)
+            collected_frames = b""
+            collected_duration = 0.0
+            max_sample_duration = 15.0
+
+            for start_sec, end_sec, text in segments_data:
+                if collected_duration >= max_sample_duration:
+                    break
+
+                start_frame = int(start_sec * sr)
+                end_frame = min(int(end_sec * sr), total_frames)
+                bytes_per_frame = channels * sampwidth
+                start_byte = start_frame * bytes_per_frame
+                end_byte = end_frame * bytes_per_frame
+
+                if start_byte < len(all_audio) and end_byte <= len(all_audio):
+                    collected_frames += all_audio[start_byte:end_byte]
+                    collected_duration += (end_sec - start_sec)
+
+            if not collected_frames:
+                return None
+
+            # Save as WAV
+            safe_label = speaker_label.replace(" ", "_").lower()
+            sample_filename = f"voiceprint_{vp_id}_{safe_label}.wav"
+            out_path = self.config.storage.audio_dir / sample_filename
+
+            with wave.open(str(out_path), "wb") as wf_out:
+                wf_out.setnchannels(channels)
+                wf_out.setsampwidth(sampwidth)
+                wf_out.setframerate(sr)
+                wf_out.writeframes(collected_frames)
+
+            logger.info("Saved voice print audio sample: %s (%.1fs)", sample_filename, collected_duration)
+            return sample_filename
+
+        except Exception as e:
+            logger.debug("Failed to save voice print audio sample: %s", e)
+            return None
 
     @property
     def is_paused(self) -> bool:
