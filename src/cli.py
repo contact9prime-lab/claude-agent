@@ -317,7 +317,7 @@ def ui(device: int | None, mic: bool, port: int, no_listen: bool) -> None:
     """Start the web dashboard with live transcript view."""
     import threading
     import uvicorn
-    from src.web.app import create_app
+    from src.web.app import create_app, set_agent_ref
 
     config = AgentConfig()
 
@@ -338,6 +338,7 @@ def ui(device: int | None, mic: bool, port: int, no_listen: bool) -> None:
                 device = bh
 
         agent = DeskVoiceAgent(config, device=device)
+        set_agent_ref(agent)
 
         def run_agent():
             try:

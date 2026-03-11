@@ -68,11 +68,23 @@ CREATE TABLE IF NOT EXISTS speakers (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS recordings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER,
+    filename TEXT NOT NULL,
+    duration_seconds REAL DEFAULT 0,
+    transcript TEXT DEFAULT '',
+    summary TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
 CREATE INDEX IF NOT EXISTS idx_hashtags_tag ON hashtags(tag);
 CREATE INDEX IF NOT EXISTS idx_hashtags_session ON hashtags(session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_recordings_session ON recordings(session_id);
 
 -- Full-text search on transcripts
 CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
@@ -374,6 +386,42 @@ class Database:
         """Delete a speaker profile."""
         self.conn.execute("DELETE FROM speakers WHERE id = ?", (speaker_id,))
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Recordings
+    # ------------------------------------------------------------------
+
+    def add_recording(
+        self,
+        session_id: int,
+        filename: str,
+        duration_seconds: float,
+        transcript: str = "",
+        summary: str = "",
+    ) -> int:
+        """Add a recording entry for audio playback."""
+        cursor = self.conn.execute(
+            """INSERT INTO recordings (session_id, filename, duration_seconds, transcript, summary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, filename, duration_seconds, transcript, summary, datetime.now().isoformat()),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def list_recordings(self, limit: int = 50) -> list[dict]:
+        """List recent recordings."""
+        rows = self.conn.execute(
+            """SELECT r.*, s.title as session_title
+            FROM recordings r LEFT JOIN sessions s ON r.session_id = s.id
+            ORDER BY r.id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_recording(self, recording_id: int) -> Optional[dict]:
+        """Get a single recording by ID."""
+        row = self.conn.execute("SELECT * FROM recordings WHERE id = ?", (recording_id,)).fetchone()
+        return dict(row) if row else None
 
     # ------------------------------------------------------------------
     # Search
