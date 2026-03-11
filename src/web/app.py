@@ -27,33 +27,47 @@ logger = logging.getLogger(__name__)
 # Global event bus for SSE and WebSocket
 _event_queues: list[asyncio.Queue] = []
 _ws_clients: list[WebSocket] = []
+_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 def broadcast_event(event_type: str, data: dict) -> None:
-    """Broadcast an event to all connected SSE and WebSocket clients."""
+    """Broadcast an event to all connected SSE and WebSocket clients.
+
+    Thread-safe: can be called from any thread (agent loop, background threads, etc.).
+    """
     msg = {"type": event_type, "data": data, "timestamp": datetime.now().isoformat()}
 
-    # SSE clients
+    # SSE clients — put_nowait is thread-safe on asyncio.Queue
     for q in _event_queues:
         try:
             q.put_nowait(msg)
         except asyncio.QueueFull:
             pass
 
-    # WebSocket clients
+    # WebSocket clients — must schedule on the asyncio event loop
+    if not _ws_clients:
+        return
+
     msg_str = json.dumps(msg)
-    disconnected = []
-    for ws in _ws_clients:
+
+    async def _send_to_all():
+        disconnected = []
+        for ws in _ws_clients:
+            try:
+                await ws.send_text(msg_str)
+            except Exception:
+                disconnected.append(ws)
+        for ws in disconnected:
+            try:
+                _ws_clients.remove(ws)
+            except ValueError:
+                pass
+
+    loop = _event_loop
+    if loop is not None and loop.is_running():
         try:
-            asyncio.get_event_loop().call_soon_threadsafe(
-                asyncio.ensure_future, ws.send_text(msg_str)
-            )
+            asyncio.run_coroutine_threadsafe(_send_to_all(), loop)
         except Exception:
-            disconnected.append(ws)
-    for ws in disconnected:
-        try:
-            _ws_clients.remove(ws)
-        except ValueError:
             pass
 
 
@@ -63,6 +77,11 @@ def create_app(config: AgentConfig) -> FastAPI:
 
     db = Database(config.storage.db_path)
     db.connect()
+
+    @app.on_event("startup")
+    async def _capture_event_loop():
+        global _event_loop
+        _event_loop = asyncio.get_running_loop()
 
     # --- WebSocket endpoint ---
     @app.websocket("/ws")
@@ -759,16 +778,23 @@ function handleEvent(msg) {
       break;
 
     case 'processing_complete':
+      if (state.processingTimeout) { clearTimeout(state.processingTimeout); state.processingTimeout = null; }
       setRecState('stopped');
       $('processing-banner').classList.remove('visible');
-      if (d.voice_prints_detected > 0 || d.segments_processed > 0) {
-        loadVoicePrints();
+      $('stop-btn').disabled = false;
+      // Always reload voice prints after processing
+      loadVoicePrints();
+      loadRecordings();
+      if (d.speakers_identified && d.speakers_identified.length > 0) {
+        var names = d.speakers_identified.map(function(s) { return s.label; }).join(', ');
+        $('processing-detail').textContent = 'Done! Detected: ' + names;
       }
       break;
 
     case 'processing_error':
       setRecState('stopped');
       $('processing-banner').classList.remove('visible');
+      $('stop-btn').disabled = false;
       break;
 
     case 'voice_print_progress':
@@ -821,15 +847,30 @@ function stopRecording() {
   $('processing-detail').textContent = 'Analyzing voice prints and transcripts...';
   $('stop-btn').disabled = true;
 
+  // Safety timeout: if no processing_complete event arrives in 120s, clear the banner
+  if (state.processingTimeout) clearTimeout(state.processingTimeout);
+  state.processingTimeout = setTimeout(function() {
+    if (state.recState === 'processing') {
+      setRecState('stopped');
+      $('processing-banner').classList.remove('visible');
+      $('stop-btn').disabled = false;
+      // Still try to load voice prints — processing may have finished silently
+      loadVoicePrints();
+      loadRecordings();
+    }
+  }, 120000);
+
   fetch('/api/recording/stop', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
     if (!d.ok) {
       setRecState('stopped');
       $('processing-banner').classList.remove('visible');
+      $('stop-btn').disabled = false;
     }
     // Results will come via WebSocket/SSE 'processing_complete' event
   }).catch(function() {
     setRecState('stopped');
     $('processing-banner').classList.remove('visible');
+    $('stop-btn').disabled = false;
   });
 }
 
