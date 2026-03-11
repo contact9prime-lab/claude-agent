@@ -86,9 +86,16 @@ class SileroVAD:
         if audio_float.ndim > 1:
             audio_float = audio_float[:, 0]  # Mono
 
-        # Run VAD
-        tensor = torch.from_numpy(audio_float)
-        speech_prob = self._model(tensor, self.config.sample_rate).item()
+        # Silero VAD expects exactly 512 samples per call at 16kHz.
+        # Split the frame into 512-sample windows and take the max probability.
+        window_size = 512 if self.config.sample_rate == 16000 else 256
+        speech_prob = 0.0
+        for i in range(0, len(audio_float) - window_size + 1, window_size):
+            window = audio_float[i : i + window_size]
+            tensor = torch.from_numpy(window)
+            prob = self._model(tensor, self.config.sample_rate).item()
+            if prob > speech_prob:
+                speech_prob = prob
 
         is_speech = speech_prob >= self.config.vad_threshold
         now = datetime.now()
