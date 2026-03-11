@@ -164,12 +164,12 @@ class DeskVoiceAgent:
                 logger.debug("Skipping noise chunk (%.1fs)", chunk.duration_seconds)
                 return
 
-        # Step 2: Send to Gemini for transcription + insight extraction
+        # Step 2: Send to LLM for transcription + insight extraction
         try:
             insight = self._llm.transcribe_and_extract(chunk)
             self._stats["gemini_calls"] += 1
         except Exception as e:
-            logger.error("Gemini processing failed: %s", e)
+            logger.error("LLM processing failed: %s", e)
             # Save raw audio for later reprocessing
             self._save_audio_chunk(chunk)
             return
