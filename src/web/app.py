@@ -508,12 +508,302 @@ def create_app(config: AgentConfig) -> FastAPI:
 
         return results
 
+    # --- Phone Upload ---
+    @app.post("/api/upload")
+    async def upload_recording(request: Request):
+        """Receive an audio recording uploaded from phone.
+
+        Accepts multipart form data with:
+        - audio: the audio file (webm, wav, mp4, etc.)
+        - title: optional meeting/memo title
+        - type: 'meeting', 'memo', 'conference', 'debrief' (default: 'memo')
+        """
+        import shutil
+        import tempfile
+        from fastapi import UploadFile, File, Form
+
+        content_type = request.headers.get("content-type", "")
+
+        if "multipart" in content_type:
+            form = await request.form()
+            audio_file = form.get("audio")
+            title = form.get("title", "Phone Recording")
+            rec_type = form.get("type", "memo")
+
+            if not audio_file:
+                return {"ok": False, "error": "No audio file provided"}
+
+            # Save uploaded file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ext = ".webm"
+            if hasattr(audio_file, "filename") and audio_file.filename:
+                ext = Path(audio_file.filename).suffix or ".webm"
+            filename = f"phone_{timestamp}{ext}"
+            audio_path = config.storage.audio_dir / filename
+
+            content = await audio_file.read()
+            audio_path.write_bytes(content)
+
+            # Convert to WAV if needed (for processing)
+            wav_filename = f"phone_{timestamp}.wav"
+            wav_path = config.storage.audio_dir / wav_filename
+            converted = False
+
+            try:
+                import subprocess
+                # Try ffmpeg conversion
+                result = subprocess.run(
+                    ["ffmpeg", "-i", str(audio_path), "-ar", "16000", "-ac", "1",
+                     "-f", "wav", str(wav_path), "-y"],
+                    capture_output=True, timeout=120,
+                )
+                if result.returncode == 0 and wav_path.exists():
+                    converted = True
+                    filename = wav_filename
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                # ffmpeg not available — try to use as-is
+                if ext == ".wav":
+                    wav_path = audio_path
+                    wav_filename = filename
+                    converted = True
+
+            # Create a recording entry
+            duration = 0
+            if converted and wav_path.exists():
+                try:
+                    import wave
+                    with wave.open(str(wav_path), "rb") as wf:
+                        duration = wf.getnframes() / wf.getframerate()
+                except Exception:
+                    pass
+
+            rec_id = db.add_recording(
+                session_id=None,
+                filename=filename,
+                duration_seconds=duration,
+                transcript="",
+                summary=f"[{rec_type}] {title}",
+            )
+
+            # Queue for background processing
+            import threading
+            def _process_upload():
+                try:
+                    _process_uploaded_recording(db, config, rec_id, wav_path if converted else audio_path, title, rec_type)
+                except Exception as e:
+                    logger.error("Failed to process upload #%s: %s", rec_id, e, exc_info=True)
+
+            thread = threading.Thread(target=_process_upload, daemon=True)
+            thread.start()
+
+            broadcast_event("upload_received", {
+                "recording_id": rec_id,
+                "title": title,
+                "type": rec_type,
+                "duration": duration,
+            })
+
+            return {
+                "ok": True,
+                "recording_id": rec_id,
+                "filename": filename,
+                "duration": duration,
+                "processing": True,
+            }
+        else:
+            return {"ok": False, "error": "Expected multipart form data"}
+
+    # --- Person Profiles ---
+    @app.get("/api/people")
+    def get_people():
+        """Get auto-built person profiles from voice prints and conversations."""
+        vps = db.list_voice_prints()
+        people = []
+        for vp in vps:
+            # Get all segments for this voice print
+            segments = db.conn.execute(
+                """SELECT rs.text, rs.start_seconds, rs.end_seconds, rs.recording_id,
+                          r.created_at as rec_date, r.summary as rec_summary
+                   FROM recording_segments rs
+                   LEFT JOIN recordings r ON rs.recording_id = r.id
+                   WHERE rs.voice_print_id = ?
+                   ORDER BY rs.created_at DESC""",
+                (vp["id"],),
+            ).fetchall()
+            segments = [dict(s) for s in segments]
+
+            # Calculate stats
+            total_speaking = sum(
+                (s.get("end_seconds", 0) - s.get("start_seconds", 0)) for s in segments
+            )
+            unique_recordings = len(set(s.get("recording_id") for s in segments))
+            unique_dates = len(set(
+                (s.get("rec_date", "") or "")[:10] for s in segments if s.get("rec_date")
+            ))
+
+            # Get recent topics (from recording summaries)
+            recent_topics = list(set(
+                s.get("rec_summary", "") for s in segments[:10]
+                if s.get("rec_summary") and not s["rec_summary"].startswith("[")
+            ))[:5]
+
+            # Recent quotes
+            recent_quotes = [
+                s["text"] for s in segments[:5]
+                if s.get("text") and len(s["text"]) > 20
+            ][:3]
+
+            # Last seen
+            last_seen = segments[0].get("rec_date") if segments else vp.get("created_at")
+
+            people.append({
+                "id": vp["id"],
+                "name": vp.get("mapped_speaker_name") or vp.get("label", "Unknown"),
+                "voice_print_id": vp["id"],
+                "has_audio": bool(vp.get("audio_sample_file")),
+                "total_speaking_seconds": total_speaking,
+                "conversation_count": unique_recordings,
+                "days_seen": unique_dates,
+                "last_seen": last_seen,
+                "recent_topics": recent_topics,
+                "recent_quotes": recent_quotes,
+                "sample_count": vp.get("sample_count", 0),
+            })
+
+        # Sort by most recently seen
+        people.sort(key=lambda p: p.get("last_seen", ""), reverse=True)
+        return people
+
+    @app.get("/api/people/{person_id}/history")
+    def get_person_history(person_id: int):
+        """Get full conversation history for a person."""
+        segments = db.conn.execute(
+            """SELECT rs.text, rs.start_seconds, rs.end_seconds,
+                      rs.recording_id, r.created_at, r.summary, r.filename,
+                      r.duration_seconds, r.session_id
+               FROM recording_segments rs
+               LEFT JOIN recordings r ON rs.recording_id = r.id
+               WHERE rs.voice_print_id = ?
+               ORDER BY r.created_at DESC""",
+            (person_id,),
+        ).fetchall()
+        return [dict(s) for s in segments]
+
+    # --- Daily Digest / Notifications ---
+    @app.get("/api/digest")
+    def get_daily_digest():
+        """Generate an end-of-day digest with summaries and follow-ups."""
+        briefing = db.get_daily_briefing()
+
+        # Build digest
+        digest = {
+            "date": briefing["date"],
+            "total_conversations": briefing["session_count"],
+            "total_speech_minutes": round(briefing["total_speech_seconds"] / 60, 1),
+            "people_talked_to": [s.get("speaker_name", "Unknown") for s in briefing.get("speakers", [])],
+            "pending_tasks": [],
+            "promises_made": [],
+            "topics_discussed": [t.get("tag") for t in briefing.get("tags", [])],
+        }
+
+        # Get pending tasks with context
+        for task in briefing.get("tasks", []):
+            if not task.get("completed"):
+                digest["pending_tasks"].append({
+                    "description": task.get("description", ""),
+                    "assignee": task.get("assignee", ""),
+                    "due_hint": task.get("due_hint", ""),
+                    "priority": task.get("priority", "medium"),
+                })
+
+        # Check for overdue follow-ups (tasks from previous days still pending)
+        all_pending = db.list_tasks(pending_only=True)
+        for task in all_pending:
+            created = task.get("created_at", "")
+            if created and not created.startswith(briefing["date"]):
+                digest["promises_made"].append({
+                    "description": task.get("description", ""),
+                    "assignee": task.get("assignee", ""),
+                    "created_at": created,
+                    "days_ago": (datetime.now() - datetime.fromisoformat(created)).days if created else 0,
+                })
+
+        return digest
+
     # --- HTML frontend ---
     @app.get("/", response_class=HTMLResponse)
     def index():
         return DASHBOARD_HTML
 
     return app
+
+
+def _process_uploaded_recording(db, config, rec_id, audio_path, title, rec_type):
+    """Process an uploaded recording in the background.
+
+    Transcribes via LLM, extracts insights, runs voice print analysis.
+    """
+    from src.processing.llm_provider import create_provider
+    from src.models.models import AudioChunk, AudioType
+
+    logger.info("Processing uploaded recording #%s: %s", rec_id, audio_path)
+
+    if not audio_path.exists():
+        logger.error("Audio file not found: %s", audio_path)
+        return
+
+    audio_data = audio_path.read_bytes()
+    duration = 0
+    try:
+        import wave as wave_mod
+        with wave_mod.open(str(audio_path), "rb") as wf:
+            duration = wf.getnframes() / wf.getframerate()
+    except Exception:
+        pass
+
+    chunk = AudioChunk(
+        audio_data=audio_data,
+        sample_rate=16000,
+        duration_seconds=duration,
+        timestamp_start=datetime.now(),
+        timestamp_end=datetime.now(),
+        audio_type=AudioType.SPEECH,
+        source="phone_upload",
+    )
+
+    # Transcribe via LLM
+    try:
+        llm_config = config.gemini
+        provider = create_provider(llm_config)
+        insight = provider.stream_transcribe(chunk)
+
+        # Update recording with transcript and summary
+        db.conn.execute(
+            "UPDATE recordings SET transcript = ?, summary = ?, duration_seconds = ? WHERE id = ?",
+            (insight.transcript or "", insight.summary or title, duration, rec_id),
+        )
+        db.conn.commit()
+
+        # Save tasks and hashtags
+        db.save_insight(insight, session_id=None)
+
+        broadcast_event("upload_processed", {
+            "recording_id": rec_id,
+            "transcript": (insight.transcript or "")[:200],
+            "summary": insight.summary or "",
+            "tasks_count": len(insight.tasks),
+            "title": title,
+        })
+
+        logger.info("Upload #%s processed: %s tasks, %s tags",
+                     rec_id, len(insight.tasks), len(insight.hashtags))
+
+    except Exception as e:
+        logger.error("LLM processing failed for upload #%s: %s", rec_id, e, exc_info=True)
+        broadcast_event("upload_error", {
+            "recording_id": rec_id,
+            "error": str(e),
+        })
 
 
 # Store agent stats and reference for the API
@@ -706,6 +996,40 @@ DASHBOARD_HTML = """\
   .briefing-person .person-dot { width: 8px; height: 8px; border-radius: 50%; }
   .briefing-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
 
+  /* Phone record button */
+  .phone-rec-btn { display: flex; align-items: center; gap: 8px; width: 100%; padding: 14px 16px; border-radius: var(--radius); border: 1px dashed var(--blue); background: transparent; color: var(--blue); cursor: pointer; font-family: inherit; font-size: 0.9em; font-weight: 600; margin-bottom: 12px; transition: all 0.2s; }
+  .phone-rec-btn:active { background: var(--blue); color: white; }
+  .phone-rec-btn.recording { border-color: var(--red); color: var(--red); border-style: solid; animation: rec-pulse 1.5s infinite; }
+  .phone-rec-btn .phone-icon { font-size: 1.3em; }
+  .phone-rec-status { font-size: 0.7em; color: var(--text-dim); margin-top: 2px; }
+  .phone-rec-timer { font-variant-numeric: tabular-nums; font-weight: 700; }
+  .phone-upload-queue { margin-top: 8px; }
+  .phone-upload-item { display: flex; align-items: center; gap: 8px; padding: 8px; background: var(--surface2); border-radius: 6px; margin-bottom: 4px; font-size: 0.8em; }
+  .phone-upload-item .upload-status { flex-shrink: 0; }
+  .phone-upload-item .upload-info { flex: 1; }
+  .phone-upload-item .upload-progress { width: 40px; text-align: right; color: var(--text-dim); font-size: 0.8em; }
+
+  /* Person profile cards */
+  .person-card { background: var(--surface2); border: 1px solid var(--accent); border-radius: var(--radius); padding: 14px; margin-bottom: 10px; cursor: pointer; transition: border-color 0.2s; }
+  .person-card:active { border-color: var(--green); }
+  .person-card-header { display: flex; align-items: center; gap: 12px; }
+  .person-card .person-avatar { width: 48px; height: 48px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.2em; font-weight: bold; flex-shrink: 0; color: white; }
+  .person-card .person-name { font-size: 1em; font-weight: 700; }
+  .person-card .person-stats { display: flex; gap: 12px; font-size: 0.7em; color: var(--text-dim); margin-top: 4px; }
+  .person-card .person-last-seen { font-size: 0.7em; color: var(--text-dim); margin-top: 2px; }
+  .person-card .person-topics { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .person-card .person-topic { background: var(--accent); color: var(--blue); padding: 2px 8px; border-radius: 10px; font-size: 0.7em; }
+  .person-card .person-quotes { margin-top: 8px; padding-top: 8px; border-top: 1px solid #ffffff10; }
+  .person-card .person-quote { font-size: 0.75em; color: var(--text-dim); line-height: 1.3; padding: 3px 0 3px 8px; border-left: 2px solid; margin-bottom: 4px; }
+  .person-card .person-actions { display: flex; gap: 6px; margin-top: 10px; }
+  .person-card .person-actions button { background: var(--accent); border: none; color: var(--text-dim); padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 0.75em; font-family: inherit; }
+  .person-card .person-actions button:active { color: var(--text); }
+  .person-card .person-actions .listen-btn { color: var(--green); border: 1px solid var(--green); background: transparent; }
+
+  /* Person detail overlay */
+  .person-detail-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg); z-index: 300; overflow-y: auto; padding: 12px; }
+  .person-detail-overlay.visible { display: block; }
+
   /* Search bar */
   .search-bar { display: flex; gap: 8px; margin-bottom: 12px; }
   .search-input { flex: 1; padding: 10px 14px; border-radius: var(--radius); border: 1px solid var(--accent); background: var(--surface); color: var(--text); font-family: inherit; font-size: 0.85em; outline: none; }
@@ -778,6 +1102,17 @@ DASHBOARD_HTML = """\
       <span class="meeting-icon">&#127908;</span> Start a Meeting
     </button>
 
+    <!-- Phone recording button -->
+    <button class="phone-rec-btn" id="phone-rec-btn" onclick="togglePhoneRecording()">
+      <span class="phone-icon">&#128241;</span>
+      <div>
+        <div id="phone-rec-label">Quick Voice Memo</div>
+        <div class="phone-rec-status" id="phone-rec-status">Tap to record from this device</div>
+      </div>
+      <span class="phone-rec-timer" id="phone-rec-timer" style="display:none;margin-left:auto;">00:00</span>
+    </button>
+    <div class="phone-upload-queue" id="phone-upload-queue"></div>
+
     <!-- Daily briefing card -->
     <div class="briefing" id="briefing-card">
       <div class="briefing-header">Today's Briefing</div>
@@ -840,10 +1175,20 @@ DASHBOARD_HTML = """\
   <!-- People / Voice Prints tab -->
   <div class="tab-content" id="tab-people">
     <div class="card">
-      <h2>Detected Voices <span class="count" id="vp-count"></span></h2>
+      <h2>People <span class="count" id="people-count"></span></h2>
+      <div id="people-list"><div class="empty">No people detected yet. Record conversations to build profiles.</div></div>
+    </div>
+    <div class="card">
+      <h2>Voice Prints <span class="count" id="vp-count"></span></h2>
       <div id="voice-prints-list"><div class="empty">No voice prints detected yet. Record and stop to analyze.</div></div>
     </div>
   </div>
+</div>
+
+<!-- Person detail overlay -->
+<div class="person-detail-overlay" id="person-detail-overlay">
+  <button class="session-detail-back" onclick="closePersonDetail()">&#8592; Back</button>
+  <div id="person-detail-content"></div>
 </div>
 
 <!-- Session detail overlay -->
@@ -1034,6 +1379,36 @@ function handleEvent(msg) {
       loadVoicePrints();
       break;
 
+    case 'upload_received':
+      break;
+
+    case 'upload_processed':
+      // Find the upload item and mark it done
+      document.querySelectorAll('.phone-upload-item').forEach(function(el) {
+        var progress = el.querySelector('.upload-progress');
+        if (progress && progress.textContent === 'Processing...') {
+          progress.textContent = 'Done!';
+          var statusEl = el.querySelector('.upload-status');
+          if (statusEl) statusEl.textContent = '\\u2714';
+          setTimeout(function() { el.remove(); }, 8000);
+        }
+      });
+      // Refresh briefing and people
+      loadBriefing();
+      if (document.getElementById('tab-people').classList.contains('active')) loadPeople();
+      break;
+
+    case 'upload_error':
+      document.querySelectorAll('.phone-upload-item').forEach(function(el) {
+        var progress = el.querySelector('.upload-progress');
+        if (progress && progress.textContent === 'Processing...') {
+          progress.textContent = 'Error';
+          var statusEl = el.querySelector('.upload-status');
+          if (statusEl) statusEl.textContent = '\\u26A0';
+        }
+      });
+      break;
+
     case 'reminder':
       break;
 
@@ -1050,7 +1425,7 @@ function switchTab(name) {
   if (tab) tab.classList.add('active');
   var nav = document.getElementById('nav-' + name);
   if (nav) nav.classList.add('active');
-  if (name === 'people') loadVoicePrints();
+  if (name === 'people') { loadPeople(); loadVoicePrints(); }
   if (name === 'sessions') loadSessions();
   if (name === 'search') { var inp = $('search-input'); if (inp) inp.focus(); }
 }
@@ -1789,6 +2164,341 @@ function editTask(taskId) {
       if (el) el.firstChild.textContent = desc;
     });
   }
+}
+
+// ---- Phone Recording (MediaRecorder) ----
+var phoneState = {
+  isRecording: false,
+  mediaRecorder: null,
+  chunks: [],
+  startTime: null,
+  timerInterval: null,
+  pendingUploads: [],
+};
+
+function togglePhoneRecording() {
+  if (phoneState.isRecording) {
+    stopPhoneRecording();
+  } else {
+    startPhoneRecording();
+  }
+}
+
+function startPhoneRecording() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert('Microphone access not available. Use HTTPS or a supported browser.');
+    return;
+  }
+
+  navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+    phoneState.chunks = [];
+    var options = {};
+    if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+      options.mimeType = 'audio/webm;codecs=opus';
+    } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+      options.mimeType = 'audio/webm';
+    } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+      options.mimeType = 'audio/mp4';
+    }
+
+    var recorder = new MediaRecorder(stream, options);
+    phoneState.mediaRecorder = recorder;
+
+    recorder.ondataavailable = function(e) {
+      if (e.data.size > 0) phoneState.chunks.push(e.data);
+    };
+
+    recorder.onstop = function() {
+      stream.getTracks().forEach(function(t) { t.stop(); });
+      if (phoneState.chunks.length === 0) return;
+
+      var blob = new Blob(phoneState.chunks, { type: recorder.mimeType || 'audio/webm' });
+      var duration = Math.round((Date.now() - phoneState.startTime) / 1000);
+
+      // Store in IndexedDB for offline resilience
+      saveToOfflineQueue(blob, duration);
+
+      // Upload immediately if online
+      uploadPhoneRecording(blob, duration);
+    };
+
+    recorder.start(1000); // Collect data every second
+    phoneState.isRecording = true;
+    phoneState.startTime = Date.now();
+
+    // Update UI
+    var btn = $('phone-rec-btn');
+    btn.classList.add('recording');
+    $('phone-rec-label').textContent = 'Recording...';
+    $('phone-rec-status').textContent = 'Tap to stop';
+    $('phone-rec-timer').style.display = 'block';
+
+    phoneState.timerInterval = setInterval(function() {
+      var elapsed = Math.floor((Date.now() - phoneState.startTime) / 1000);
+      var mins = Math.floor(elapsed / 60);
+      var secs = elapsed % 60;
+      $('phone-rec-timer').textContent = String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+    }, 1000);
+
+  }).catch(function(err) {
+    alert('Microphone access denied: ' + err.message);
+  });
+}
+
+function stopPhoneRecording() {
+  if (phoneState.mediaRecorder && phoneState.mediaRecorder.state !== 'inactive') {
+    phoneState.mediaRecorder.stop();
+  }
+  phoneState.isRecording = false;
+
+  if (phoneState.timerInterval) {
+    clearInterval(phoneState.timerInterval);
+    phoneState.timerInterval = null;
+  }
+
+  var btn = $('phone-rec-btn');
+  btn.classList.remove('recording');
+  $('phone-rec-label').textContent = 'Quick Voice Memo';
+  $('phone-rec-status').textContent = 'Tap to record from this device';
+  $('phone-rec-timer').style.display = 'none';
+}
+
+function uploadPhoneRecording(blob, durationSec) {
+  var title = 'Voice memo ' + new Date().toLocaleTimeString();
+  var formData = new FormData();
+  var ext = (blob.type || '').includes('mp4') ? '.mp4' : '.webm';
+  formData.append('audio', blob, 'memo' + ext);
+  formData.append('title', title);
+  formData.append('type', 'memo');
+
+  var uploadId = Date.now();
+  addUploadItem(uploadId, title, durationSec, 'uploading');
+
+  fetch('/api/upload', {
+    method: 'POST',
+    body: formData,
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      updateUploadItem(uploadId, 'processing', 'Processing...');
+    } else {
+      updateUploadItem(uploadId, 'error', d.error || 'Upload failed');
+    }
+  }).catch(function(err) {
+    updateUploadItem(uploadId, 'error', 'Network error — saved offline');
+    // Will retry from IndexedDB later
+  });
+}
+
+function addUploadItem(id, title, durationSec, status) {
+  var queue = $('phone-upload-queue');
+  var item = document.createElement('div');
+  item.className = 'phone-upload-item';
+  item.id = 'upload-' + id;
+  var statusIcon = status === 'uploading' ? '\\u23F3' : status === 'processing' ? '\\u2699' : '\\u2714';
+  item.innerHTML = '<span class="upload-status">' + statusIcon + '</span>'
+    + '<div class="upload-info">' + escHtml(title) + ' (' + durationSec + 's)</div>'
+    + '<div class="upload-progress" id="upload-progress-' + id + '">' + status + '</div>';
+  queue.prepend(item);
+}
+
+function updateUploadItem(id, status, text) {
+  var progress = document.getElementById('upload-progress-' + id);
+  if (progress) progress.textContent = text || status;
+  var item = document.getElementById('upload-' + id);
+  if (item) {
+    var statusEl = item.querySelector('.upload-status');
+    if (status === 'done') statusEl.textContent = '\\u2714';
+    else if (status === 'error') statusEl.textContent = '\\u26A0';
+    else if (status === 'processing') statusEl.textContent = '\\u2699';
+  }
+  // Auto-remove completed items after 10s
+  if (status === 'done') {
+    setTimeout(function() {
+      var el = document.getElementById('upload-' + id);
+      if (el) el.remove();
+    }, 10000);
+  }
+}
+
+// IndexedDB for offline storage
+var offlineDB = null;
+function openOfflineDB() {
+  return new Promise(function(resolve, reject) {
+    if (offlineDB) { resolve(offlineDB); return; }
+    var req = indexedDB.open('deskvoice-offline', 1);
+    req.onupgradeneeded = function(e) {
+      var db = e.target.result;
+      if (!db.objectStoreNames.contains('recordings')) {
+        db.createObjectStore('recordings', { keyPath: 'id', autoIncrement: true });
+      }
+    };
+    req.onsuccess = function(e) { offlineDB = e.target.result; resolve(offlineDB); };
+    req.onerror = function() { reject(new Error('IndexedDB failed')); };
+  });
+}
+
+function saveToOfflineQueue(blob, durationSec) {
+  openOfflineDB().then(function(db) {
+    var tx = db.transaction('recordings', 'readwrite');
+    tx.objectStore('recordings').add({
+      blob: blob,
+      duration: durationSec,
+      timestamp: new Date().toISOString(),
+      uploaded: false,
+    });
+  }).catch(function() {});
+}
+
+function retryOfflineUploads() {
+  openOfflineDB().then(function(db) {
+    var tx = db.transaction('recordings', 'readonly');
+    var store = tx.objectStore('recordings');
+    var req = store.getAll();
+    req.onsuccess = function() {
+      var records = req.result || [];
+      records.forEach(function(rec) {
+        if (!rec.uploaded) {
+          uploadPhoneRecording(rec.blob, rec.duration);
+          // Mark as uploaded
+          var tx2 = db.transaction('recordings', 'readwrite');
+          rec.uploaded = true;
+          tx2.objectStore('recordings').put(rec);
+        }
+      });
+    };
+  }).catch(function() {});
+}
+
+// Retry offline uploads when coming back online
+window.addEventListener('online', retryOfflineUploads);
+
+// ---- People Profiles ----
+function loadPeople() {
+  fetch('/api/people').then(function(r) { return r.json(); }).then(function(people) {
+    var list = $('people-list');
+    list.innerHTML = '';
+    if (!people || people.length === 0) {
+      list.innerHTML = '<div class="empty">No people detected yet. Record conversations to build profiles.</div>';
+      $('people-count').textContent = '';
+      return;
+    }
+    $('people-count').textContent = '(' + people.length + ')';
+
+    people.forEach(function(p, idx) {
+      var card = document.createElement('div');
+      card.className = 'person-card';
+      var color = vpColors[idx % vpColors.length];
+      var initial = (p.name || 'U')[0].toUpperCase();
+      var speakingMins = Math.round(p.total_speaking_seconds / 60);
+      var lastSeen = p.last_seen ? timeAgo(p.last_seen) : 'Never';
+
+      var html = '<div class="person-card-header">'
+        + '<div class="person-avatar" style="background:' + color + ';">' + initial + '</div>'
+        + '<div>'
+        + '<div class="person-name">' + escHtml(p.name) + '</div>'
+        + '<div class="person-stats">'
+        + '<span>' + speakingMins + 'm speaking</span>'
+        + '<span>' + p.conversation_count + ' conversations</span>'
+        + '<span>' + p.days_seen + ' days</span>'
+        + '</div>'
+        + '<div class="person-last-seen">Last seen: ' + lastSeen + '</div>'
+        + '</div>'
+        + '</div>';
+
+      // Topics
+      if (p.recent_topics && p.recent_topics.length > 0) {
+        html += '<div class="person-topics">';
+        p.recent_topics.forEach(function(t) {
+          html += '<span class="person-topic">' + escHtml(t) + '</span>';
+        });
+        html += '</div>';
+      }
+
+      // Recent quotes
+      if (p.recent_quotes && p.recent_quotes.length > 0) {
+        html += '<div class="person-quotes">';
+        p.recent_quotes.forEach(function(q) {
+          html += '<div class="person-quote" style="border-color:' + color + ';">&ldquo;' + escHtml(q.substring(0, 120)) + (q.length > 120 ? '...' : '') + '&rdquo;</div>';
+        });
+        html += '</div>';
+      }
+
+      // Actions
+      html += '<div class="person-actions">';
+      if (p.has_audio) {
+        html += '<button class="listen-btn" onclick="event.stopPropagation();playVoicePrint(' + p.voice_print_id + ')">Listen</button>';
+      }
+      html += '<button onclick="event.stopPropagation();openPersonDetail(' + p.id + ',\\'' + escHtml(p.name).replace(/'/g, "\\\\'") + '\\')">History</button>';
+      html += '</div>';
+
+      card.innerHTML = html;
+      card.onclick = function() { openPersonDetail(p.id, p.name); };
+      list.appendChild(card);
+    });
+  });
+}
+
+function openPersonDetail(personId, name) {
+  $('person-detail-overlay').classList.add('visible');
+  $('person-detail-content').innerHTML = '<div class="empty">Loading...</div>';
+
+  fetch('/api/people/' + personId + '/history').then(function(r) { return r.json(); }).then(function(segments) {
+    var html = '<h2 style="color:var(--green);margin:8px 0;">' + escHtml(name) + '</h2>';
+
+    if (!segments || segments.length === 0) {
+      html += '<div class="empty">No conversation history found.</div>';
+      $('person-detail-content').innerHTML = html;
+      return;
+    }
+
+    html += '<div style="font-size:0.75em;color:var(--text-dim);margin-bottom:12px;">'
+      + segments.length + ' speaking segments found</div>';
+
+    // Group by recording/date
+    var byDate = {};
+    segments.forEach(function(s) {
+      var date = (s.created_at || '').substring(0, 10);
+      if (!byDate[date]) byDate[date] = [];
+      byDate[date].push(s);
+    });
+
+    for (var date in byDate) {
+      html += '<div class="card" style="margin-bottom:10px;">';
+      html += '<h2>' + date + ' <span class="count">' + byDate[date].length + ' segments</span></h2>';
+      if (byDate[date][0].summary) {
+        html += '<div style="font-size:0.8em;color:var(--blue);margin-bottom:8px;font-style:italic;">' + escHtml(byDate[date][0].summary) + '</div>';
+      }
+      byDate[date].forEach(function(seg) {
+        if (seg.text && seg.text.trim()) {
+          html += '<div style="font-size:0.8em;color:var(--text-dim);line-height:1.4;padding:4px 0 4px 8px;border-bottom:1px solid #ffffff08;">'
+            + '&ldquo;' + escHtml(seg.text) + '&rdquo;</div>';
+        }
+      });
+      html += '</div>';
+    }
+
+    $('person-detail-content').innerHTML = html;
+  });
+}
+
+function closePersonDetail() {
+  $('person-detail-overlay').classList.remove('visible');
+}
+
+function timeAgo(dateStr) {
+  if (!dateStr) return 'Unknown';
+  var now = new Date();
+  var then = new Date(dateStr);
+  var diffMs = now - then;
+  var diffMins = Math.floor(diffMs / 60000);
+  if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return diffMins + 'm ago';
+  var diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return diffHours + 'h ago';
+  var diffDays = Math.floor(diffHours / 24);
+  if (diffDays === 1) return 'Yesterday';
+  if (diffDays < 7) return diffDays + ' days ago';
+  return then.toLocaleDateString();
 }
 
 // ---- Initialize ----
