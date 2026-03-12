@@ -1,21 +1,34 @@
 services:
+  # Cloud mode: Web UI + Telegram + WhatsApp + Slack
+  # No microphone needed — receives audio via chat apps and web uploads
   deskvoice:
     build: .
     image: deskvoice:latest
     container_name: deskvoice
     restart: unless-stopped
     env_file: .env
+    ports:
+      - "${WEB_PORT:-8765}:8765"
+      - "${WEBHOOK_PORT:-8443}:8443"
     volumes:
-      # Persist transcripts and audio
       - deskvoice-data:/data
-      # Pass host PulseAudio socket for audio capture
-      # Linux: this just works
-      # macOS: requires pulseaudio running with module-native-protocol-unix
-      - ${PULSE_SOCKET:-/run/user/1000/pulse/native}:/tmp/pulseaudio.socket
-      # PulseAudio cookie for auth
-      - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
     environment:
-      - PULSE_SERVER=unix:/tmp/pulseaudio.socket
+      - DB_PATH=/data/deskvoice.db
+      - AUDIO_DIR=/data/audio
+
+  # Optional: local listening mode (needs audio device)
+  # deskvoice-listener:
+  #   build: .
+  #   container_name: deskvoice-listener
+  #   restart: unless-stopped
+  #   env_file: .env
+  #   command: ["listen"]
+  #   volumes:
+  #     - deskvoice-data:/data
+  #     - ${PULSE_SOCKET:-/run/user/1000/pulse/native}:/tmp/pulseaudio.socket
+  #     - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
+  #   environment:
+  #     - PULSE_SERVER=unix:/tmp/pulseaudio.socket
 
 volumes:
   deskvoice-data:

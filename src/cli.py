@@ -404,6 +404,146 @@ def done(task_id: int) -> None:
     db.close()
 
 
+@cli.command()
+@click.option("--telegram", is_flag=True, help="Start Telegram bot")
+@click.option("--whatsapp", is_flag=True, help="Enable WhatsApp webhook")
+@click.option("--slack", is_flag=True, help="Start Slack bot")
+@click.option("--all", "all_bots", is_flag=True, help="Start all configured bots")
+def bot(telegram: bool, whatsapp: bool, slack: bool, all_bots: bool) -> None:
+    """Start chat bot integrations (Telegram, WhatsApp, Slack).
+
+    Examples:
+        deskvoice bot --telegram
+        deskvoice bot --slack
+        deskvoice bot --all
+    """
+    import threading
+
+    config = AgentConfig()
+
+    if all_bots:
+        telegram = whatsapp = slack = True
+
+    if not (telegram or whatsapp or slack):
+        console.print("[yellow]Specify at least one bot: --telegram, --slack, --whatsapp, or --all[/yellow]")
+        return
+
+    started = []
+
+    if telegram:
+        try:
+            from src.integrations.telegram_bot import TelegramBot
+            tg = TelegramBot(config)
+            console.print("[green]Starting Telegram bot...[/green]")
+            # Telegram runs its own event loop, so run in thread if other bots need to start
+            if slack:
+                t = threading.Thread(target=tg.run, daemon=True)
+                t.start()
+                started.append("Telegram")
+            else:
+                started.append("Telegram")
+                console.print(f"[bold green]Bots running: {', '.join(started)}[/bold green]")
+                tg.run()  # Blocks
+                return
+        except ValueError as e:
+            console.print(f"[red]Telegram:[/red] {e}")
+        except ImportError:
+            console.print("[red]Telegram:[/red] pip install python-telegram-bot>=21.0")
+
+    if slack:
+        try:
+            from src.integrations.slack_bot import SlackBot
+            sb = SlackBot(config)
+            console.print("[green]Starting Slack bot...[/green]")
+            started.append("Slack")
+            console.print(f"[bold green]Bots running: {', '.join(started)}[/bold green]")
+            sb.run()  # Blocks
+        except ValueError as e:
+            console.print(f"[red]Slack:[/red] {e}")
+        except ImportError:
+            console.print("[red]Slack:[/red] pip install slack-bolt>=1.18")
+
+    if whatsapp and not slack:
+        console.print("[yellow]WhatsApp uses webhooks — start with 'deskvoice cloud' to enable.[/yellow]")
+
+    if started:
+        console.print(f"[bold green]Bots running: {', '.join(started)}[/bold green]")
+
+
+@cli.command()
+@click.option("--port", default=8765, help="Web UI port")
+@click.option("--telegram", is_flag=True, help="Also start Telegram bot")
+@click.option("--no-listen", is_flag=True, default=True, help="Skip audio capture (cloud mode)")
+def cloud(port: int, telegram: bool, no_listen: bool) -> None:
+    """Start DeskVoice in cloud mode: Web UI + chat bots + webhooks.
+
+    This is the 'deploy to cloud' mode — no microphone needed.
+    Receives audio via web uploads, Telegram voice messages, WhatsApp, etc.
+
+    Examples:
+        deskvoice cloud                     # Web UI + WhatsApp webhook
+        deskvoice cloud --telegram          # + Telegram bot
+        docker-compose up                   # Same thing, in Docker
+    """
+    import os
+    import threading
+    import uvicorn
+    from src.web.app import create_app
+
+    config = AgentConfig()
+
+    errors = config.validate()
+    if errors:
+        for e in errors:
+            console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    app = create_app(config)
+
+    # Register WhatsApp webhook if configured
+    whatsapp_token = os.getenv("WHATSAPP_TOKEN") or os.getenv("TWILIO_ACCOUNT_SID")
+    if whatsapp_token:
+        try:
+            from src.integrations.whatsapp import WhatsAppIntegration
+            wa = WhatsAppIntegration(config)
+            wa.register_routes(app)
+            console.print("[green]WhatsApp webhook enabled at /api/whatsapp/webhook[/green]")
+        except ImportError:
+            console.print("[yellow]WhatsApp: pip install httpx for WhatsApp support[/yellow]")
+
+    # Register Slack webhook if configured
+    slack_token = os.getenv("SLACK_BOT_TOKEN")
+    if slack_token:
+        try:
+            from src.integrations.slack_bot import SlackBot
+            sb = SlackBot(config)
+            sb.register_webhook_routes(app)
+            console.print("[green]Slack webhook enabled at /api/slack/events[/green]")
+        except (ImportError, ValueError):
+            pass
+
+    # Start Telegram bot in background if requested
+    if telegram or os.getenv("TELEGRAM_BOT_TOKEN"):
+        try:
+            from src.integrations.telegram_bot import TelegramBot
+            tg = TelegramBot(config)
+            tg_thread = threading.Thread(target=tg.run, daemon=True)
+            tg_thread.start()
+            console.print("[green]Telegram bot started (long polling)[/green]")
+        except (ValueError, ImportError) as e:
+            console.print(f"[yellow]Telegram: {e}[/yellow]")
+
+    console.print(f"\n[bold green]DeskVoice Cloud running at http://0.0.0.0:{port}[/bold green]")
+    console.print(f"  LLM: {config.llm.provider} / {config.llm.model}")
+    console.print(f"  DB: {config.storage.db_path}")
+    console.print()
+
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    except KeyboardInterrupt:
+        pass
+
+
 def main() -> None:
     cli()
 

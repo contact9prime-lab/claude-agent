@@ -14,6 +14,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install chat integration deps
+RUN pip install --no-cache-dir \
+    python-telegram-bot>=21.0 \
+    slack-bolt>=1.18 \
+    httpx>=0.25
+
 # Copy source
 COPY . .
 RUN pip install --no-cache-dir -e .
@@ -26,5 +32,10 @@ ENV AUDIO_DIR=/data/audio
 # PulseAudio config — connect to host's PulseAudio over unix socket
 ENV PULSE_SERVER=unix:/tmp/pulseaudio.socket
 
+# Web UI port
+EXPOSE 8765
+# Telegram webhook port
+EXPOSE 8443
+
 ENTRYPOINT ["deskvoice"]
-CMD ["listen"]
+CMD ["cloud"]
