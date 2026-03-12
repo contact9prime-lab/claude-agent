@@ -387,6 +387,127 @@ def create_app(config: AgentConfig) -> FastAPI:
         db.update_task(task_id, reminder_at=reminder_at)
         return {"ok": True, "reminder_at": reminder_at}
 
+    # --- Daily Briefing ---
+    @app.get("/api/briefing")
+    def get_briefing(date: str = None):
+        """Get daily briefing with sessions, tasks, speakers, and stats."""
+        return db.get_daily_briefing(date)
+
+    # --- Session Detail ---
+    @app.get("/api/sessions/{session_id}/detail")
+    def get_session_detail(session_id: int):
+        """Get detailed session with recordings, segments, participants."""
+        return db.get_session_detail(session_id)
+
+    # --- Meeting Mode ---
+    @app.post("/api/meeting/start")
+    async def start_meeting(request: Request):
+        """Start a named meeting session with optional participant list."""
+        body = await request.json()
+        title = body.get("title", "Meeting")
+        participants = body.get("participants", [])
+
+        if _agent_ref:
+            _agent_ref.resume()
+            # Force start a new session with the given title
+            if hasattr(_agent_ref, '_start_session'):
+                _agent_ref._start_session()
+            if hasattr(_agent_ref, '_current_session_id') and _agent_ref._current_session_id:
+                db.conn.execute(
+                    "UPDATE sessions SET title = ? WHERE id = ?",
+                    (title, _agent_ref._current_session_id),
+                )
+                db.conn.commit()
+                broadcast_event("session_started", {
+                    "session_id": _agent_ref._current_session_id,
+                    "title": title,
+                    "participants": participants,
+                })
+                return {
+                    "ok": True,
+                    "session_id": _agent_ref._current_session_id,
+                    "title": title,
+                }
+        return {"ok": False, "error": "Agent not available"}
+
+    @app.post("/api/meeting/end")
+    def end_meeting():
+        """End the current meeting — stop recording and process."""
+        if not _agent_ref:
+            return {"ok": False, "error": "Agent not available"}
+        import threading
+        def _process():
+            try:
+                result = _agent_ref.stop_and_process()
+                broadcast_event("processing_complete", result)
+            except Exception as e:
+                logger.error("Meeting end processing failed: %s", e)
+                broadcast_event("processing_error", {"error": str(e)})
+        thread = threading.Thread(target=_process, daemon=True)
+        thread.start()
+        return {"ok": True, "state": "processing"}
+
+    # --- Smart Search ---
+    @app.get("/api/search/smart")
+    def smart_search(q: str):
+        """Search across transcripts, tasks, and decisions with context."""
+        results = {
+            "transcripts": [],
+            "tasks": [],
+            "recordings": [],
+        }
+
+        # Search transcripts via FTS
+        try:
+            sessions = db.search_transcripts(q, limit=10)
+            for s in sessions:
+                # Highlight matching context
+                transcript = s.get("transcript", "")
+                q_lower = q.lower()
+                idx = transcript.lower().find(q_lower)
+                if idx >= 0:
+                    start = max(0, idx - 80)
+                    end = min(len(transcript), idx + len(q) + 80)
+                    context = ("..." if start > 0 else "") + transcript[start:end] + ("..." if end < len(transcript) else "")
+                else:
+                    context = transcript[:200]
+                s["context"] = context
+            results["transcripts"] = sessions
+        except Exception:
+            pass
+
+        # Search tasks
+        try:
+            all_tasks = db.list_tasks(pending_only=False)
+            q_lower = q.lower()
+            matching_tasks = [
+                t for t in all_tasks
+                if q_lower in (t.get("description", "") or "").lower()
+                or q_lower in (t.get("assignee", "") or "").lower()
+            ]
+            results["tasks"] = matching_tasks[:10]
+        except Exception:
+            pass
+
+        # Search recordings by transcript content
+        try:
+            recs = db.list_recordings(limit=200)
+            q_lower = q.lower()
+            matching_recs = []
+            for r in recs:
+                transcript = r.get("transcript", "") or ""
+                if q_lower in transcript.lower():
+                    idx = transcript.lower().find(q_lower)
+                    start = max(0, idx - 60)
+                    end = min(len(transcript), idx + len(q) + 60)
+                    r["context"] = ("..." if start > 0 else "") + transcript[start:end] + ("..." if end < len(transcript) else "")
+                    matching_recs.append(r)
+            results["recordings"] = matching_recs[:10]
+        except Exception:
+            pass
+
+        return results
+
     # --- HTML frontend ---
     @app.get("/", response_class=HTMLResponse)
     def index():
@@ -411,7 +532,10 @@ DASHBOARD_HTML = """\
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0f0f0f">
 <title>DeskVoice</title>
 <style>
   :root {
@@ -419,68 +543,77 @@ DASHBOARD_HTML = """\
     --accent: #0f3460; --text: #e0e0e0; --text-dim: #888;
     --green: #4ecca3; --yellow: #f0c929; --red: #e74c3c; --blue: #3498db;
     --orange: #e67e22; --purple: #9b59b6;
+    --radius: 10px; --safe-bottom: env(safe-area-inset-bottom, 0px);
   }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'SF Mono', 'Fira Code', monospace; background: var(--bg); color: var(--text); }
-  .container { max-width: 1400px; margin: 0 auto; padding: 16px; }
-  header { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--accent); margin-bottom: 16px; }
-  header h1 { font-size: 1.4em; color: var(--green); }
-  .header-right { display: flex; align-items: center; gap: 16px; }
-  .status { display: flex; gap: 16px; font-size: 0.85em; color: var(--text-dim); }
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); overflow-x: hidden; -webkit-font-smoothing: antialiased; }
+  .container { max-width: 1000px; margin: 0 auto; padding: 12px; padding-bottom: calc(80px + var(--safe-bottom)); }
+  header { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--accent); margin-bottom: 12px; position: sticky; top: 0; background: var(--bg); z-index: 100; }
+  header h1 { font-size: 1.1em; color: var(--green); font-weight: 700; }
+  .header-right { display: flex; align-items: center; gap: 8px; }
+  .status { font-size: 0.7em; color: var(--text-dim); }
   .status .live { color: var(--green); animation: pulse 2s infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
-  /* Recording controls */
-  .rec-controls { display: flex; align-items: center; gap: 12px; }
-  .rec-btn { width: 44px; height: 44px; border-radius: 50%; border: 2px solid var(--accent); background: var(--surface); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
-  .rec-btn:hover { border-color: var(--green); transform: scale(1.05); }
+  /* Recording controls - compact for mobile */
+  .rec-controls { display: flex; align-items: center; gap: 6px; }
+  .rec-btn { width: 36px; height: 36px; border-radius: 50%; border: 2px solid var(--accent); background: var(--surface); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
+  .rec-btn:active { transform: scale(0.95); }
   .rec-btn.recording { border-color: var(--red); animation: rec-pulse 1.5s infinite; }
   .rec-btn.recording .rec-icon { background: var(--red); }
   .rec-btn.paused { border-color: var(--yellow); }
-  .rec-btn.paused .rec-icon { background: var(--yellow); border-radius: 2px; width: 14px; height: 14px; }
+  .rec-btn.paused .rec-icon { background: var(--yellow); border-radius: 2px; width: 12px; height: 12px; }
   .rec-btn.stopped { border-color: var(--text-dim); }
   .rec-btn.stopped .rec-icon { background: var(--green); }
   .rec-btn.processing { border-color: var(--orange); animation: rec-pulse 1s infinite; }
-  .rec-btn.processing .rec-icon { background: var(--orange); border-radius: 2px; width: 14px; height: 14px; }
-  .rec-icon { width: 16px; height: 16px; border-radius: 50%; background: var(--green); transition: all 0.2s; }
+  .rec-btn.processing .rec-icon { background: var(--orange); border-radius: 2px; width: 12px; height: 12px; }
+  .rec-icon { width: 14px; height: 14px; border-radius: 50%; background: var(--green); transition: all 0.2s; }
   @keyframes rec-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.4); } 50% { box-shadow: 0 0 0 8px rgba(231, 76, 60, 0); } }
-  .rec-timer { font-size: 1.3em; font-weight: bold; font-variant-numeric: tabular-nums; min-width: 80px; color: var(--text); }
+  .rec-timer { font-size: 1em; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
   .rec-timer.active { color: var(--red); }
   .rec-timer.paused { color: var(--yellow); }
   .rec-timer.processing { color: var(--orange); }
-  .rec-label { font-size: 0.75em; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }
-  .stop-btn { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--red); background: transparent; color: var(--red); cursor: pointer; font-family: inherit; font-size: 0.8em; font-weight: bold; transition: all 0.2s; }
-  .stop-btn:hover { background: var(--red); color: white; }
-  .stop-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .rec-label { display: none; }
+  .stop-btn { padding: 5px 10px; border-radius: var(--radius); border: 1px solid var(--red); background: transparent; color: var(--red); cursor: pointer; font-family: inherit; font-size: 0.7em; font-weight: 700; transition: all 0.2s; }
+  .stop-btn:active { background: var(--red); color: white; }
+  .stop-btn:disabled { opacity: 0.3; }
 
-  /* Tabs */
-  .tabs { display: flex; gap: 2px; margin-bottom: 16px; background: var(--surface); border-radius: 8px; padding: 3px; }
-  .tab { padding: 8px 16px; border: none; background: transparent; color: var(--text-dim); cursor: pointer; border-radius: 6px; font-family: inherit; font-size: 0.85em; transition: all 0.2s; }
-  .tab:hover { color: var(--text); background: var(--surface2); }
-  .tab.active { color: var(--green); background: var(--accent); }
+  /* Bottom nav bar - mobile-first */
+  .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); border-top: 1px solid var(--accent); display: flex; justify-content: space-around; padding: 6px 0 calc(6px + var(--safe-bottom)); z-index: 200; }
+  .nav-btn { display: flex; flex-direction: column; align-items: center; gap: 2px; background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 4px 8px; font-family: inherit; font-size: 0.6em; transition: color 0.2s; -webkit-tap-highlight-color: transparent; }
+  .nav-btn:active, .nav-btn.active { color: var(--green); }
+  .nav-btn .nav-icon { font-size: 1.6em; }
+  .nav-btn .nav-badge { background: var(--red); color: white; border-radius: 8px; padding: 0 5px; font-size: 0.8em; min-width: 14px; text-align: center; }
   .tab-content { display: none; }
   .tab-content.active { display: block; }
 
-  .grid { display: grid; grid-template-columns: 1fr 380px; gap: 16px; }
-  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
-  .card { background: var(--surface); border: 1px solid var(--accent); border-radius: 8px; padding: 16px; margin-bottom: 12px; }
-  .card h2 { font-size: 0.9em; color: var(--green); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; display: flex; justify-content: space-between; align-items: center; }
+  /* Meeting start button */
+  .meeting-btn { display: flex; align-items: center; gap: 8px; width: 100%; padding: 14px 16px; border-radius: var(--radius); border: 1px dashed var(--green); background: transparent; color: var(--green); cursor: pointer; font-family: inherit; font-size: 0.9em; font-weight: 600; margin-bottom: 12px; transition: all 0.2s; }
+  .meeting-btn:active { background: var(--green); color: black; }
+  .meeting-btn .meeting-icon { font-size: 1.3em; }
+
+  .grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  @media (min-width: 768px) { .grid { grid-template-columns: 1fr 340px; } }
+  .card { background: var(--surface); border: 1px solid var(--accent); border-radius: var(--radius); padding: 12px; margin-bottom: 10px; }
+  .card h2 { font-size: 0.8em; color: var(--green); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; display: flex; justify-content: space-between; align-items: center; }
   .card h2 .count { color: var(--text-dim); font-size: 0.9em; }
   .transcript-entry { padding: 8px 0; border-bottom: 1px solid #ffffff10; }
   .transcript-entry .time { color: var(--text-dim); font-size: 0.75em; }
   .transcript-entry .speaker-tag { display: inline-block; background: var(--accent); color: var(--blue); padding: 1px 6px; border-radius: 4px; font-size: 0.75em; margin-left: 6px; }
   .transcript-entry .text { margin-top: 4px; line-height: 1.5; }
   .transcript-entry .summary { color: var(--blue); font-size: 0.85em; margin-top: 4px; font-style: italic; }
-  .task-item { display: flex; align-items: flex-start; gap: 8px; padding: 8px 0; border-bottom: 1px solid #ffffff10; }
-  .task-item .priority { font-size: 0.7em; padding: 2px 6px; border-radius: 4px; font-weight: bold; flex-shrink: 0; }
+  .task-item { display: flex; align-items: flex-start; gap: 8px; padding: 10px 0; border-bottom: 1px solid #ffffff10; }
+  .task-item .priority { font-size: 0.65em; padding: 3px 8px; border-radius: 4px; font-weight: 700; flex-shrink: 0; text-transform: uppercase; }
   .task-item .priority.high { background: var(--red); color: white; }
   .task-item .priority.medium { background: var(--yellow); color: black; }
   .task-item .priority.low { background: var(--accent); color: var(--text); }
-  .task-item .desc { flex: 1; }
-  .task-item .assignee { color: var(--yellow); font-size: 0.85em; }
-  .task-item .due { color: var(--text-dim); font-size: 0.8em; }
-  .task-item button { background: var(--green); border: none; color: black; padding: 3px 8px; border-radius: 4px; cursor: pointer; font-size: 0.75em; flex-shrink: 0; }
-  .task-item button:hover { opacity: 0.8; }
+  .task-item .desc { flex: 1; font-size: 0.85em; line-height: 1.4; }
+  .task-item .assignee { color: var(--yellow); font-size: 0.8em; }
+  .task-item .due { color: var(--text-dim); font-size: 0.75em; }
+  .task-item .task-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .task-item button { background: var(--green); border: none; color: black; padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 0.7em; font-weight: 600; min-height: 28px; }
+  .task-item button:active { opacity: 0.7; }
+  .task-item .edit-btn { background: var(--accent); color: var(--text-dim); }
   .tag { display: inline-block; background: var(--accent); color: var(--blue); padding: 3px 10px; border-radius: 12px; font-size: 0.8em; margin: 3px; cursor: default; }
   .tag:hover { background: var(--surface2); }
   .token-bar { display: flex; gap: 16px; font-size: 0.85em; flex-wrap: wrap; }
@@ -499,18 +632,10 @@ DASHBOARD_HTML = """\
   .streaming-indicator.active { display: block; }
 
   /* Recordings list */
-  .recording-item { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #ffffff10; }
-  .recording-item .rec-play-btn { width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--green); background: transparent; color: var(--green); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 0.2s; }
-  .recording-item .rec-play-btn:hover { background: var(--green); color: black; }
-  .recording-item .rec-play-btn.playing { border-color: var(--red); color: var(--red); }
-  .recording-item .rec-play-btn.playing:hover { background: var(--red); color: white; }
-  .recording-item .rec-info { flex: 1; min-width: 0; }
-  .recording-item .rec-info .rec-time { font-size: 0.75em; color: var(--text-dim); }
-  .recording-item .rec-info .rec-transcript { font-size: 0.85em; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .recording-item .rec-info .rec-summary { font-size: 0.8em; color: var(--blue); font-style: italic; }
-  .recording-item .rec-info .rec-speakers { font-size: 0.75em; color: var(--purple); margin-top: 2px; }
-  .recording-item .rec-duration { color: var(--text-dim); font-size: 0.8em; flex-shrink: 0; }
-  #recordings-list { max-height: 500px; overflow-y: auto; }
+  .recording-item { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid #ffffff10; }
+  .recording-item .rec-play-btn { width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--green); background: transparent; color: var(--green); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .recording-item .rec-play-btn:active { background: var(--green); color: black; }
+  .recording-item .rec-info { flex: 1; min-width: 0; font-size: 0.8em; }
 
   /* Audio player bar */
   .audio-player-bar { display: none; background: var(--surface2); border: 1px solid var(--accent); border-radius: 8px; padding: 10px 16px; margin-bottom: 12px; align-items: center; gap: 12px; }
@@ -562,12 +687,49 @@ DASHBOARD_HTML = """\
   .speaker-enroll-hint { font-size: 0.8em; color: var(--text-dim); margin-top: 8px; padding: 8px; background: var(--surface2); border-radius: 6px; }
 
   /* Processing overlay */
-  .processing-banner { display: none; background: var(--surface2); border: 1px solid var(--orange); border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; align-items: center; gap: 12px; }
+  .processing-banner { display: none; background: var(--surface2); border: 1px solid var(--orange); border-radius: var(--radius); padding: 10px 14px; margin-bottom: 10px; align-items: center; gap: 10px; }
   .processing-banner.visible { display: flex; }
-  .processing-banner .spinner { width: 20px; height: 20px; border: 2px solid var(--orange); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  .processing-banner .spinner { width: 18px; height: 18px; border: 2px solid var(--orange); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .processing-banner .processing-text { flex: 1; color: var(--orange); font-size: 0.9em; }
-  .processing-banner .processing-detail { font-size: 0.75em; color: var(--text-dim); }
+  .processing-banner .processing-text { flex: 1; color: var(--orange); font-size: 0.85em; }
+  .processing-banner .processing-detail { font-size: 0.7em; color: var(--text-dim); }
+
+  /* Briefing card */
+  .briefing { background: linear-gradient(135deg, var(--surface2), var(--surface)); border: 1px solid var(--accent); border-radius: var(--radius); padding: 14px; margin-bottom: 12px; }
+  .briefing-header { font-size: 0.9em; font-weight: 700; color: var(--green); margin-bottom: 10px; }
+  .briefing-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px; }
+  .briefing-stat { text-align: center; padding: 8px; background: var(--bg); border-radius: 8px; }
+  .briefing-stat .stat-value { font-size: 1.4em; font-weight: 700; color: var(--green); }
+  .briefing-stat .stat-label { font-size: 0.65em; color: var(--text-dim); text-transform: uppercase; margin-top: 2px; }
+  .briefing-people { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .briefing-person { display: flex; align-items: center; gap: 6px; background: var(--accent); padding: 4px 10px; border-radius: 16px; font-size: 0.75em; }
+  .briefing-person .person-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .briefing-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+
+  /* Search bar */
+  .search-bar { display: flex; gap: 8px; margin-bottom: 12px; }
+  .search-input { flex: 1; padding: 10px 14px; border-radius: var(--radius); border: 1px solid var(--accent); background: var(--surface); color: var(--text); font-family: inherit; font-size: 0.85em; outline: none; }
+  .search-input:focus { border-color: var(--green); }
+  .search-input::placeholder { color: var(--text-dim); }
+  .search-results { margin-top: 8px; }
+  .search-result { padding: 10px; background: var(--surface); border: 1px solid var(--accent); border-radius: var(--radius); margin-bottom: 6px; }
+  .search-result .result-type { font-size: 0.65em; color: var(--blue); text-transform: uppercase; font-weight: 700; }
+  .search-result .result-context { font-size: 0.8em; color: var(--text-dim); margin-top: 4px; line-height: 1.4; }
+  .search-result mark { background: var(--yellow); color: black; border-radius: 2px; padding: 0 2px; }
+
+  /* Session timeline */
+  .session-item { padding: 10px; background: var(--surface2); border: 1px solid var(--accent); border-radius: var(--radius); margin-bottom: 8px; cursor: pointer; transition: border-color 0.2s; }
+  .session-item:active { border-color: var(--green); }
+  .session-item .session-title { font-size: 0.85em; font-weight: 600; }
+  .session-item .session-meta { font-size: 0.7em; color: var(--text-dim); margin-top: 4px; display: flex; gap: 12px; }
+  .session-item .session-preview { font-size: 0.75em; color: var(--text-dim); margin-top: 6px; line-height: 1.3; }
+  .session-detail-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg); z-index: 300; overflow-y: auto; padding: 12px; }
+  .session-detail-overlay.visible { display: block; }
+  .session-detail-back { display: flex; align-items: center; gap: 8px; color: var(--green); background: none; border: none; cursor: pointer; font-family: inherit; font-size: 0.85em; padding: 8px 0; }
+  .session-participants { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+  .session-segment { display: flex; gap: 8px; padding: 8px 0; border-bottom: 1px solid #ffffff08; }
+  .session-segment .seg-speaker { font-size: 0.75em; font-weight: 600; min-width: 70px; flex-shrink: 0; }
+  .session-segment .seg-text { font-size: 0.8em; color: var(--text-dim); line-height: 1.4; }
 </style>
 </head>
 <body>
@@ -576,16 +738,13 @@ DASHBOARD_HTML = """\
     <h1>DeskVoice</h1>
     <div class="header-right">
       <div class="rec-controls">
-        <div class="rec-label" id="rec-label">Recording</div>
-        <button class="rec-btn recording" id="rec-btn" onclick="toggleRecording()" title="Pause/Resume recording">
+        <button class="rec-btn recording" id="rec-btn" onclick="toggleRecording()">
           <div class="rec-icon"></div>
         </button>
         <div class="rec-timer active" id="rec-timer">00:00</div>
-        <button class="stop-btn" id="stop-btn" onclick="stopRecording()" title="Stop and process">STOP</button>
+        <button class="stop-btn" id="stop-btn" onclick="stopRecording()">STOP</button>
       </div>
-      <div class="status">
-        <span id="connection" class="live">&#9679; Connected</span>
-      </div>
+      <span id="connection" class="status live">&#9679;</span>
     </div>
   </header>
 
@@ -610,78 +769,106 @@ DASHBOARD_HTML = """\
     <button class="player-close" onclick="closePlayer()">&#10005;</button>
   </div>
 
-  <!-- Tabs -->
-  <div class="tabs">
-    <button class="tab active" onclick="switchTab('dashboard')">Dashboard</button>
-    <button class="tab" onclick="switchTab('recordings')">Recordings</button>
-    <button class="tab" onclick="switchTab('voiceprints')">Voice Prints</button>
-    <button class="tab" onclick="switchTab('speakers')">Speakers</button>
-  </div>
+  <!-- Tabs are now bottom nav -->
 
-  <!-- Dashboard tab -->
-  <div class="tab-content active" id="tab-dashboard">
-    <div class="card">
-      <h2>Token Usage</h2>
-      <div class="token-bar">
-        <span>Input: <span class="val" id="tokens-in">0</span></span>
-        <span>Output: <span class="val" id="tokens-out">0</span></span>
-        <span>Total: <span class="val" id="tokens-total">0</span></span>
-        <span>Chunks: <span class="val" id="chunks-count">0</span></span>
-        <span>Speech: <span class="val" id="speech-secs">0s</span></span>
+  <!-- Home / Briefing tab -->
+  <div class="tab-content active" id="tab-home">
+    <!-- Meeting start button -->
+    <button class="meeting-btn" onclick="startMeeting()">
+      <span class="meeting-icon">&#127908;</span> Start a Meeting
+    </button>
+
+    <!-- Daily briefing card -->
+    <div class="briefing" id="briefing-card">
+      <div class="briefing-header">Today's Briefing</div>
+      <div class="briefing-stats">
+        <div class="briefing-stat"><div class="stat-value" id="b-sessions">0</div><div class="stat-label">Sessions</div></div>
+        <div class="briefing-stat"><div class="stat-value" id="b-speech">0m</div><div class="stat-label">Speech</div></div>
+        <div class="briefing-stat"><div class="stat-value" id="b-tasks">0</div><div class="stat-label">Tasks</div></div>
       </div>
+      <div class="briefing-people" id="b-people"></div>
+      <div class="briefing-tags" id="b-tags"></div>
     </div>
-    <div class="grid">
-      <div>
-        <div class="card">
-          <h2>Live Transcript</h2>
-          <div class="streaming-indicator" id="streaming-indicator">Transcribing...</div>
-          <div id="transcript-feed"><div class="empty">Waiting for speech...</div></div>
-        </div>
-        <div class="card">
-          <h2>Decisions & Questions</h2>
-          <div id="decisions-feed"><div class="empty">None yet</div></div>
-        </div>
-      </div>
-      <div>
-        <div class="card">
-          <h2>Tasks <span class="count" id="tasks-count"></span></h2>
-          <div id="tasks-list"><div class="empty">No tasks yet</div></div>
-        </div>
-        <div class="card">
-          <h2>Tags <span class="count" id="tags-count"></span></h2>
-          <div id="tags-list"><div class="empty">No tags yet</div></div>
-        </div>
-      </div>
+
+    <!-- Live transcript -->
+    <div class="card">
+      <h2>Live Transcript</h2>
+      <div class="streaming-indicator" id="streaming-indicator">Transcribing...</div>
+      <div id="transcript-feed"><div class="empty">Waiting for speech...</div></div>
+    </div>
+
+    <!-- Token bar (compact) -->
+    <div class="token-bar" style="padding: 8px; font-size: 0.7em; color: var(--text-dim);">
+      <span>In:<span class="val" id="tokens-in">0</span></span>
+      <span>Out:<span class="val" id="tokens-out">0</span></span>
+      <span>Chunks:<span class="val" id="chunks-count">0</span></span>
     </div>
   </div>
 
-  <!-- Recordings tab -->
-  <div class="tab-content" id="tab-recordings">
+  <!-- Tasks tab -->
+  <div class="tab-content" id="tab-tasks">
     <div class="card">
-      <h2>Recordings <span class="count" id="rec-count"></span></h2>
-      <div id="recordings-list"><div class="empty">No recordings yet</div></div>
+      <h2>Action Items <span class="count" id="tasks-count"></span></h2>
+      <div id="tasks-list"><div class="empty">No tasks yet</div></div>
+    </div>
+    <div class="card">
+      <h2>Decisions & Questions</h2>
+      <div id="decisions-feed"><div class="empty">None yet</div></div>
+    </div>
+    <div class="card">
+      <h2>Tags <span class="count" id="tags-count"></span></h2>
+      <div id="tags-list"><div class="empty">No tags yet</div></div>
     </div>
   </div>
 
-  <!-- Voice Prints tab -->
-  <div class="tab-content" id="tab-voiceprints">
+  <!-- Sessions tab -->
+  <div class="tab-content" id="tab-sessions">
     <div class="card">
-      <h2>Detected Voice Prints <span class="count" id="vp-count"></span></h2>
-      <div id="voice-prints-list"><div class="empty">No voice prints detected yet. Record audio and stop to analyze.</div></div>
+      <h2>Today's Sessions</h2>
+      <div id="sessions-list"><div class="empty">No sessions yet</div></div>
     </div>
   </div>
 
-  <!-- Speakers tab -->
-  <div class="tab-content" id="tab-speakers">
+  <!-- Search tab -->
+  <div class="tab-content" id="tab-search">
+    <div class="search-bar">
+      <input class="search-input" id="search-input" type="search" placeholder="Search transcripts, tasks, recordings..." oninput="debounceSearch()">
+    </div>
+    <div class="search-results" id="search-results"></div>
+  </div>
+
+  <!-- People / Voice Prints tab -->
+  <div class="tab-content" id="tab-people">
     <div class="card">
-      <h2>Enrolled Speakers</h2>
-      <div id="speakers-list"><div class="empty">No speakers enrolled</div></div>
-      <div class="speaker-enroll-hint">
-        To enroll a new speaker, use the CLI: <code>deskvoice enroll &lt;name&gt;</code><br>
-        Or map a detected voice print to a speaker name in the Voice Prints tab.
-      </div>
+      <h2>Detected Voices <span class="count" id="vp-count"></span></h2>
+      <div id="voice-prints-list"><div class="empty">No voice prints detected yet. Record and stop to analyze.</div></div>
     </div>
   </div>
+</div>
+
+<!-- Session detail overlay -->
+<div class="session-detail-overlay" id="session-detail-overlay">
+  <button class="session-detail-back" onclick="closeSessionDetail()">&#8592; Back</button>
+  <div id="session-detail-content"></div>
+</div>
+
+<!-- Bottom navigation bar -->
+<div class="bottom-nav">
+  <button class="nav-btn active" onclick="switchTab('home')" id="nav-home">
+    <span class="nav-icon">&#127968;</span>Home
+  </button>
+  <button class="nav-btn" onclick="switchTab('tasks')" id="nav-tasks">
+    <span class="nav-icon">&#9745;</span>Tasks<span class="nav-badge" id="nav-tasks-badge" style="display:none">0</span>
+  </button>
+  <button class="nav-btn" onclick="switchTab('sessions')" id="nav-sessions">
+    <span class="nav-icon">&#128488;</span>Sessions
+  </button>
+  <button class="nav-btn" onclick="switchTab('search')" id="nav-search">
+    <span class="nav-icon">&#128269;</span>Search
+  </button>
+  <button class="nav-btn" onclick="switchTab('people')" id="nav-people">
+    <span class="nav-icon">&#128101;</span>People
+  </button>
 </div>
 
 <audio id="audio-el" preload="auto"></audio>
@@ -700,6 +887,9 @@ const state = {
   wsReconnectDelay: 1000,
   voicePrints: [],
   speakers: [],
+  searchTimer: null,
+  vpPlayingId: null,
+  processingTimeout: null,
 };
 
 function $(id) { return document.getElementById(id); }
@@ -852,15 +1042,17 @@ function handleEvent(msg) {
   }
 }
 
-// ---- Tabs ----
+// ---- Navigation ----
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+  document.querySelectorAll('.nav-btn').forEach(function(b) { b.classList.remove('active'); });
   document.querySelectorAll('.tab-content').forEach(function(t) { t.classList.remove('active'); });
-  document.querySelector('.tab-content#tab-' + name).classList.add('active');
-  event.target.classList.add('active');
-  if (name === 'recordings') loadRecordings();
-  if (name === 'voiceprints') loadVoicePrints();
-  if (name === 'speakers') loadSpeakers();
+  var tab = document.getElementById('tab-' + name);
+  if (tab) tab.classList.add('active');
+  var nav = document.getElementById('nav-' + name);
+  if (nav) nav.classList.add('active');
+  if (name === 'people') loadVoicePrints();
+  if (name === 'sessions') loadSessions();
+  if (name === 'search') { var inp = $('search-input'); if (inp) inp.focus(); }
 }
 
 // ---- Recording controls ----
@@ -993,8 +1185,11 @@ function addTranscript(data) {
 function addTask(task) {
   var list = $('tasks-list');
   if (list.querySelector('.empty')) list.innerHTML = '';
+  state.tasks.push(task);
   state.taskCount++;
   $('tasks-count').textContent = '(' + state.taskCount + ')';
+  // Update badge
+  if ($('nav-tasks-badge')) { $('nav-tasks-badge').style.display = 'inline'; $('nav-tasks-badge').textContent = state.taskCount; }
 
   var item = document.createElement('div');
   item.className = 'task-item';
@@ -1005,7 +1200,10 @@ function addTask(task) {
     + (task.assignee ? '<div class="assignee">-> ' + escHtml(task.assignee) + '</div>' : '')
     + (task.due_hint ? '<div class="due">Due: ' + escHtml(task.due_hint) + '</div>' : '')
     + '</div>'
-    + (task.id ? '<button onclick="markDone(' + task.id + ')">Done</button>' : '');
+    + '<div class="task-actions">'
+    + (task.id ? '<button class="edit-btn" onclick="editTask(' + task.id + ')">Edit</button>' : '')
+    + (task.id ? '<button onclick="markDone(' + task.id + ')">Done</button>' : '')
+    + '</div>';
   list.prepend(item);
 }
 
@@ -1073,33 +1271,12 @@ function escHtml(s) {
 
 // ---- Recordings ----
 function loadRecordings() {
-  fetch('/api/recordings').then(function(r) { return r.json(); }).then(function(recs) {
-    var list = $('recordings-list');
-    list.innerHTML = '';
-    if (!recs || recs.length === 0) {
-      list.innerHTML = '<div class="empty">No recordings yet</div>';
-      $('rec-count').textContent = '';
-      return;
-    }
-    $('rec-count').textContent = '(' + recs.length + ')';
-    recs.forEach(function(rec) {
-      var item = document.createElement('div');
-      item.className = 'recording-item';
-      var time = new Date(rec.created_at).toLocaleString();
-      var dur = formatDuration(rec.duration_seconds);
-      var transcript = rec.transcript ? rec.transcript.substring(0, 120) : 'No transcript';
-      var isPlaying = state.currentRecId === rec.id && state.isPlaying;
-      item.innerHTML = '<button class="rec-play-btn' + (isPlaying ? ' playing' : '') + '" onclick="playRecording(' + rec.id + ')" title="Play">'
-        + (isPlaying ? '&#9632;' : '&#9654;') + '</button>'
-        + '<div class="rec-info">'
-        + '<div class="rec-time">' + time + '</div>'
-        + '<div class="rec-transcript">' + escHtml(transcript) + '</div>'
-        + (rec.summary ? '<div class="rec-summary">' + escHtml(rec.summary) + '</div>' : '')
-        + '</div>'
-        + '<span class="rec-duration">' + dur + '</span>';
-      list.appendChild(item);
-    });
-  });
+  // Recordings are now shown inside session detail view
+  // This function refreshes the briefing and sessions list
+  loadBriefing();
+  if (document.getElementById('tab-sessions').classList.contains('active')) {
+    loadSessions();
+  }
 }
 
 function formatDuration(secs) {
@@ -1367,65 +1544,255 @@ function deleteVoicePrint(id) {
   }
 }
 
-// ---- Speakers ----
-function loadSpeakers() {
-  fetch('/api/speakers').then(function(r) { return r.json(); }).then(function(speakers) {
-    var list = $('speakers-list');
+// ---- Meeting Mode ----
+function startMeeting() {
+  var title = prompt('Meeting name (e.g., "Weekly Standup", "1:1 with Alice"):');
+  if (!title) return;
+  fetch('/api/meeting/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: title }),
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      setRecState('recording');
+      state.recStartTime = Date.now();
+      startTimer();
+      switchTab('home');
+    }
+  });
+}
+
+// ---- Daily Briefing ----
+function loadBriefing() {
+  fetch('/api/briefing').then(function(r) { return r.json(); }).then(function(b) {
+    $('b-sessions').textContent = b.session_count || 0;
+    $('b-speech').textContent = Math.round((b.total_speech_seconds || 0) / 60) + 'm';
+    $('b-tasks').textContent = b.pending_tasks || 0;
+
+    // Update task badge
+    if (b.pending_tasks > 0) {
+      $('nav-tasks-badge').style.display = 'inline';
+      $('nav-tasks-badge').textContent = b.pending_tasks;
+    }
+
+    // People
+    var people = $('b-people');
+    people.innerHTML = '';
+    var colors = ['#3498db', '#e74c3c', '#2ecc71', '#9b59b6', '#e67e22', '#1abc9c'];
+    (b.speakers || []).forEach(function(s, i) {
+      var el = document.createElement('div');
+      el.className = 'briefing-person';
+      var c = colors[i % colors.length];
+      el.innerHTML = '<span class="person-dot" style="background:' + c + '"></span>'
+        + escHtml(s.speaker_name || 'Unknown')
+        + ' <span style="color:var(--text-dim)">' + Math.round(s.total_seconds / 60) + 'm</span>';
+      people.appendChild(el);
+    });
+
+    // Tags
+    var tags = $('b-tags');
+    tags.innerHTML = '';
+    (b.tags || []).slice(0, 10).forEach(function(t) {
+      var el = document.createElement('span');
+      el.className = 'tag';
+      el.textContent = '#' + t.tag;
+      el.style.fontSize = '0.7em';
+      tags.appendChild(el);
+    });
+  });
+}
+
+// ---- Sessions ----
+function loadSessions() {
+  fetch('/api/sessions?limit=20').then(function(r) { return r.json(); }).then(function(sessions) {
+    var list = $('sessions-list');
     list.innerHTML = '';
-    state.speakers = speakers;
-    if (!speakers || speakers.length === 0) {
-      list.innerHTML = '<div class="empty">No speakers enrolled</div>';
+    if (!sessions || sessions.length === 0) {
+      list.innerHTML = '<div class="empty">No sessions yet</div>';
       return;
     }
-    speakers.forEach(function(sp) {
+    sessions.forEach(function(s) {
       var item = document.createElement('div');
-      item.className = 'speaker-item';
-      var initials = sp.name.split(' ').map(function(w) { return w[0]; }).join('').toUpperCase().substring(0, 2);
-      item.innerHTML = '<div class="speaker-avatar">' + escHtml(initials) + '</div>'
-        + '<div class="speaker-info">'
-        + '<div class="speaker-name" id="speaker-name-' + sp.id + '">' + escHtml(sp.name) + '</div>'
-        + '<div class="speaker-date">Enrolled: ' + new Date(sp.created_at).toLocaleDateString() + '</div>'
-        + '</div>'
-        + '<div class="speaker-actions">'
-        + '<button onclick="renameSpeaker(' + sp.id + ')">Rename</button>'
-        + '</div>';
+      item.className = 'session-item';
+      item.onclick = function() { openSessionDetail(s.id); };
+      var time = new Date(s.started_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+      var dur = Math.round((s.total_speech_seconds || 0) / 60);
+      var preview = (s.transcript || '').substring(0, 100);
+      item.innerHTML = '<div class="session-title">' + escHtml(s.title || 'Session #' + s.id) + '</div>'
+        + '<div class="session-meta"><span>' + time + '</span><span>' + dur + ' min speech</span><span>' + escHtml(s.status || '') + '</span></div>'
+        + (preview ? '<div class="session-preview">' + escHtml(preview) + '...</div>' : '');
       list.appendChild(item);
     });
   });
 }
 
-function renameSpeaker(id) {
-  var nameEl = document.getElementById('speaker-name-' + id);
-  if (!nameEl) return;
-  var current = nameEl.textContent;
-  var newName = prompt('Rename speaker:', current);
-  if (newName && newName !== current) {
-    fetch('/api/speakers/' + id, {
+function openSessionDetail(sessionId) {
+  $('session-detail-overlay').classList.add('visible');
+  $('session-detail-content').innerHTML = '<div class="empty">Loading...</div>';
+  fetch('/api/sessions/' + sessionId + '/detail').then(function(r) { return r.json(); }).then(function(s) {
+    if (!s) { $('session-detail-content').innerHTML = '<div class="empty">Session not found</div>'; return; }
+    var html = '<h2 style="color:var(--green);margin:8px 0;">' + escHtml(s.title || 'Session #' + s.id) + '</h2>';
+    html += '<div style="font-size:0.75em;color:var(--text-dim);margin-bottom:12px;">'
+      + new Date(s.started_at).toLocaleString() + ' | '
+      + Math.round((s.total_speech_seconds || 0) / 60) + ' min speech</div>';
+
+    // Participants
+    var parts = s.participants || {};
+    if (Object.keys(parts).length > 0) {
+      html += '<div class="session-participants">';
+      var colors = ['#3498db', '#e74c3c', '#2ecc71', '#9b59b6', '#e67e22'];
+      var ci = 0;
+      for (var name in parts) {
+        var p = parts[name];
+        html += '<div class="briefing-person"><span class="person-dot" style="background:' + colors[ci % colors.length] + '"></span>'
+          + escHtml(name) + ' (' + Math.round(p.total_seconds / 60) + 'm)</div>';
+        ci++;
+      }
+      html += '</div>';
+    }
+
+    // Tasks
+    if (s.tasks && s.tasks.length > 0) {
+      html += '<div class="card" style="margin-top:12px"><h2>Tasks</h2>';
+      s.tasks.forEach(function(t) {
+        html += '<div class="task-item"><span class="priority ' + (t.priority || 'medium') + '">' + (t.priority || 'M').charAt(0).toUpperCase() + '</span>'
+          + '<div class="desc">' + escHtml(t.description) + '</div></div>';
+      });
+      html += '</div>';
+    }
+
+    // Tags
+    if (s.tags && s.tags.length > 0) {
+      html += '<div style="margin:8px 0;">';
+      s.tags.forEach(function(t) {
+        html += '<span class="tag">#' + escHtml(t.tag) + '</span>';
+      });
+      html += '</div>';
+    }
+
+    // Summary
+    if (s.summary) {
+      html += '<div class="card"><h2>Summary</h2><div style="font-size:0.85em;line-height:1.5;color:var(--text-dim);">' + escHtml(s.summary) + '</div></div>';
+    }
+
+    // Segments (transcript with speaker attribution)
+    var segs = s.segments || [];
+    if (segs.length > 0) {
+      html += '<div class="card"><h2>Transcript</h2>';
+      var spkColors = {};
+      var spkCI = 0;
+      segs.forEach(function(seg) {
+        var spk = seg.resolved_speaker || seg.speaker_label || 'Unknown';
+        if (!spkColors[spk]) { spkColors[spk] = colors[spkCI % colors.length]; spkCI++; }
+        html += '<div class="session-segment">'
+          + '<div class="seg-speaker" style="color:' + spkColors[spk] + '">' + escHtml(spk) + '</div>'
+          + '<div class="seg-text">' + escHtml(seg.text || '') + '</div>'
+          + '</div>';
+      });
+      html += '</div>';
+    } else if (s.transcript) {
+      html += '<div class="card"><h2>Transcript</h2><div style="font-size:0.8em;line-height:1.5;white-space:pre-wrap;">' + escHtml(s.transcript) + '</div></div>';
+    }
+
+    // Recordings with playback
+    if (s.recordings && s.recordings.length > 0) {
+      html += '<div class="card"><h2>Recordings</h2>';
+      s.recordings.forEach(function(rec) {
+        html += '<div class="recording-item">'
+          + '<button class="rec-play-btn" onclick="playRecording(' + rec.id + ')">&#9654;</button>'
+          + '<div class="rec-info"><div class="rec-time">' + formatDuration(rec.duration_seconds) + '</div></div>'
+          + '</div>';
+      });
+      html += '</div>';
+    }
+
+    $('session-detail-content').innerHTML = html;
+  });
+}
+
+function closeSessionDetail() {
+  $('session-detail-overlay').classList.remove('visible');
+}
+
+// ---- Smart Search ----
+function debounceSearch() {
+  clearTimeout(state.searchTimer);
+  state.searchTimer = setTimeout(doSearch, 400);
+}
+
+function doSearch() {
+  var q = $('search-input').value.trim();
+  var results = $('search-results');
+  if (q.length < 2) { results.innerHTML = ''; return; }
+
+  fetch('/api/search/smart?q=' + encodeURIComponent(q)).then(function(r) { return r.json(); }).then(function(d) {
+    results.innerHTML = '';
+    var total = (d.transcripts || []).length + (d.tasks || []).length + (d.recordings || []).length;
+    if (total === 0) {
+      results.innerHTML = '<div class="empty">No results for "' + escHtml(q) + '"</div>';
+      return;
+    }
+
+    // Tasks
+    (d.tasks || []).forEach(function(t) {
+      var el = document.createElement('div');
+      el.className = 'search-result';
+      el.innerHTML = '<div class="result-type">Task</div>'
+        + '<div style="font-size:0.85em;margin-top:4px;">' + highlightText(t.description || '', q) + '</div>'
+        + (t.assignee ? '<div style="font-size:0.75em;color:var(--yellow);">-> ' + escHtml(t.assignee) + '</div>' : '');
+      results.appendChild(el);
+    });
+
+    // Transcripts
+    (d.transcripts || []).forEach(function(s) {
+      var el = document.createElement('div');
+      el.className = 'search-result';
+      el.style.cursor = 'pointer';
+      el.onclick = function() { openSessionDetail(s.id); };
+      el.innerHTML = '<div class="result-type">Session: ' + escHtml(s.title || 'Session #' + s.id) + '</div>'
+        + '<div class="result-context">' + highlightText(s.context || '', q) + '</div>';
+      results.appendChild(el);
+    });
+
+    // Recordings
+    (d.recordings || []).forEach(function(r) {
+      var el = document.createElement('div');
+      el.className = 'search-result';
+      el.innerHTML = '<div class="result-type">Recording: ' + escHtml(r.filename || '') + '</div>'
+        + '<div class="result-context">' + highlightText(r.context || '', q) + '</div>';
+      results.appendChild(el);
+    });
+  });
+}
+
+function highlightText(text, query) {
+  if (!query) return escHtml(text);
+  var safe = escHtml(text);
+  var qEsc = escHtml(query);
+  var regex = new RegExp('(' + qEsc.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + ')', 'gi');
+  return safe.replace(regex, '<mark>$1</mark>');
+}
+
+// ---- Task inline editing ----
+function editTask(taskId) {
+  var task = state.tasks.find(function(t) { return t.id === taskId; });
+  if (!task) return;
+  var desc = prompt('Edit task:', task.description);
+  if (desc && desc !== task.description) {
+    fetch('/api/tasks/' + taskId, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newName }),
-    }).then(function(r) { return r.json(); }).then(function() {
-      nameEl.textContent = newName;
+      body: JSON.stringify({ description: desc }),
+    }).then(function() {
+      task.description = desc;
+      var el = document.querySelector('#task-' + taskId + ' .desc');
+      if (el) el.firstChild.textContent = desc;
     });
   }
 }
 
 // ---- Initialize ----
-// Try WebSocket first, fall back to SSE
 connectWS();
-
-// Also set up SSE as fallback for older browsers
-function connectSSE() {
-  var es = new EventSource('/api/events');
-  es.onmessage = function(e) {
-    var msg = JSON.parse(e.data);
-    handleEvent(msg);
-  };
-  es.onerror = function() {
-    es.close();
-    setTimeout(connectSSE, 3000);
-  };
-}
 
 // Load initial data
 fetch('/api/tasks').then(function(r) { return r.json(); }).then(function(tasks) {
@@ -1444,8 +1811,6 @@ fetch('/api/stats').then(function(r) { return r.json(); }).then(function(s) {
     updateTokens();
   }
 });
-
-// Init recording state
 fetch('/api/recording/state').then(function(r) { return r.json(); }).then(function(d) {
   if (d.state) {
     setRecState(d.state);
@@ -1456,12 +1821,18 @@ fetch('/api/recording/state').then(function(r) { return r.json(); }).then(functi
   }
 });
 
-// WebSocket keepalive ping
+// Load daily briefing
+loadBriefing();
+
+// Keepalive ping
 setInterval(function() {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify({type: 'ping'}));
   }
 }, 30000);
+
+// Refresh briefing every 2 minutes
+setInterval(loadBriefing, 120000);
 </script>
 </body>
 </html>

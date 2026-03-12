@@ -580,6 +580,147 @@ class Database:
     # Search
     # ------------------------------------------------------------------
 
+    def get_daily_briefing(self, date_str: str = None) -> dict:
+        """Get a daily briefing for the given date (YYYY-MM-DD format).
+
+        Returns sessions, tasks, speakers, hashtags, and stats for the day.
+        """
+        if not date_str:
+            date_str = datetime.now().strftime("%Y-%m-%d")
+
+        # Sessions that started today
+        sessions = self.conn.execute(
+            """SELECT * FROM sessions
+               WHERE started_at LIKE ?
+               ORDER BY started_at ASC""",
+            (date_str + "%",),
+        ).fetchall()
+        sessions = [dict(s) for s in sessions]
+
+        # Tasks created today
+        tasks = self.conn.execute(
+            """SELECT * FROM tasks
+               WHERE created_at LIKE ?
+               ORDER BY created_at ASC""",
+            (date_str + "%",),
+        ).fetchall()
+        tasks = [dict(t) for t in tasks]
+
+        # Recordings from today
+        recordings = self.conn.execute(
+            """SELECT * FROM recordings
+               WHERE created_at LIKE ?
+               ORDER BY created_at ASC""",
+            (date_str + "%",),
+        ).fetchall()
+        recordings = [dict(r) for r in recordings]
+
+        # Tags from today's sessions
+        session_ids = [s["id"] for s in sessions]
+        tags = []
+        if session_ids:
+            placeholders = ",".join("?" * len(session_ids))
+            tags = self.conn.execute(
+                f"""SELECT DISTINCT tag, COUNT(*) as count
+                    FROM hashtags
+                    WHERE session_id IN ({placeholders})
+                    GROUP BY tag ORDER BY count DESC""",
+                session_ids,
+            ).fetchall()
+            tags = [dict(t) for t in tags]
+
+        # Voice prints with segments from today's recordings
+        rec_ids = [r["id"] for r in recordings]
+        speakers_today = []
+        if rec_ids:
+            placeholders = ",".join("?" * len(rec_ids))
+            speakers_today = self.conn.execute(
+                f"""SELECT DISTINCT COALESCE(s.name, vp.label, rs.speaker_label) as speaker_name,
+                           vp.id as voice_print_id,
+                           vp.audio_sample_file,
+                           COUNT(*) as segment_count,
+                           SUM(rs.end_seconds - rs.start_seconds) as total_seconds
+                    FROM recording_segments rs
+                    LEFT JOIN voice_prints vp ON rs.voice_print_id = vp.id
+                    LEFT JOIN speakers s ON vp.mapped_speaker_id = s.id
+                    WHERE rs.recording_id IN ({placeholders})
+                    GROUP BY COALESCE(s.name, vp.label, rs.speaker_label)
+                    ORDER BY total_seconds DESC""",
+                rec_ids,
+            ).fetchall()
+            speakers_today = [dict(s) for s in speakers_today]
+
+        # Stats
+        total_speech = sum(r.get("duration_seconds", 0) for r in recordings)
+        total_tasks = len(tasks)
+        pending_tasks = len([t for t in tasks if not t.get("completed")])
+
+        return {
+            "date": date_str,
+            "sessions": sessions,
+            "session_count": len(sessions),
+            "recordings": recordings,
+            "recording_count": len(recordings),
+            "tasks": tasks,
+            "total_tasks": total_tasks,
+            "pending_tasks": pending_tasks,
+            "tags": tags,
+            "speakers": speakers_today,
+            "total_speech_seconds": total_speech,
+        }
+
+    def get_session_detail(self, session_id: int) -> Optional[dict]:
+        """Get detailed session info with recordings, segments, and participants."""
+        session = self.get_session(session_id)
+        if not session:
+            return None
+
+        # Get recordings for this session
+        recordings = self.conn.execute(
+            """SELECT * FROM recordings WHERE session_id = ? ORDER BY created_at ASC""",
+            (session_id,),
+        ).fetchall()
+        recordings = [dict(r) for r in recordings]
+
+        # Get all segments across recordings with speaker info
+        all_segments = []
+        for rec in recordings:
+            segs = self.get_recording_segments(rec["id"])
+            for seg in segs:
+                seg["recording_filename"] = rec["filename"]
+            all_segments.extend(segs)
+
+        # Get participants from segments
+        participants = {}
+        for seg in all_segments:
+            speaker = seg.get("resolved_speaker", seg.get("speaker_label", "Unknown"))
+            if speaker not in participants:
+                participants[speaker] = {"total_seconds": 0, "segment_count": 0, "voice_print_id": seg.get("voice_print_id")}
+            participants[speaker]["total_seconds"] += (seg.get("end_seconds", 0) - seg.get("start_seconds", 0))
+            participants[speaker]["segment_count"] += 1
+
+        # Tasks for this session
+        tasks = self.conn.execute(
+            "SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at",
+            (session_id,),
+        ).fetchall()
+        tasks = [dict(t) for t in tasks]
+
+        # Tags for this session
+        tags = self.conn.execute(
+            "SELECT * FROM hashtags WHERE session_id = ? ORDER BY tag",
+            (session_id,),
+        ).fetchall()
+        tags = [dict(t) for t in tags]
+
+        session["recordings"] = recordings
+        session["segments"] = all_segments
+        session["participants"] = participants
+        session["tasks"] = tasks
+        session["tags"] = tags
+
+        return session
+
     def search_transcripts(self, query: str, limit: int = 20) -> list[dict]:
         """Full-text search across all transcripts."""
         rows = self.conn.execute(
